@@ -1867,6 +1867,9 @@ require('./session-updates').run(test);
 require('./sync-guard').run(test);
 require('./expenses').run(test);
 require('./recurrence-dst').run(test);
+require('./leave-balance').run(test);
+require('./day-editor-mode').run(test);
+require('./day-editor-mode').runClose(test);
 
 if (!process.exitCode) process.stdout.write('\n' + passed + ' tests passed.\n');
 

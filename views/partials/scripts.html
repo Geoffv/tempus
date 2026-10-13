@@ -2810,10 +2810,13 @@ let ratePreviewInputSyncing = false;
   // Annual leave entitlement, in days. The leave balance card compares hours banked ahead of contract
   // pace against this allowance (allowance × standard day = the hours the year's leave will consume).
   const DEFAULT_LEAVE_ALLOWANCE_DAYS = 20;
-  const getLeaveAllowanceDays = () => {
-    const v = Number(state.settings ? state.settings.leave_allowance_days : NaN);
+  // Blank means "not set" (Number('') is 0, which would silently zero the allowance); an explicit 0 is kept.
+  const normalizeLeaveAllowanceDays = (value) => {
+    if (value === null || value === undefined || String(value).trim() === '') return DEFAULT_LEAVE_ALLOWANCE_DAYS;
+    const v = Number(value);
     return Number.isFinite(v) && v >= 0 ? v : DEFAULT_LEAVE_ALLOWANCE_DAYS;
   };
+  const getLeaveAllowanceDays = () => normalizeLeaveAllowanceDays(state.settings ? state.settings.leave_allowance_days : undefined);
 
   const getTrendMethod = () => {
     const value = state.settings ? state.settings.monthly_insights_trend_method : undefined;
@@ -3141,7 +3144,7 @@ let ratePreviewInputSyncing = false;
     clone.quick_fill_hours = Number.isFinite(quickFill) && quickFill > 0 ? quickFill : null;
     clone.quick_fill_mode = clone.quick_fill_mode === 'punch' ? 'punch' : 'hours';
     clone.icon = clone.icon ? String(clone.icon) : '';
-    clone.counts_as_leave = Boolean(clone.counts_as_leave === 'TRUE' || clone.counts_as_leave === true);
+    clone.counts_as_leave = clone.counts_as_leave === true || String(clone.counts_as_leave || '').trim().toUpperCase() === 'TRUE';
     return clone;
   };
 
@@ -13137,6 +13140,7 @@ function updateDeductionFormVisibility() {
     parkDayDurationEditor();
     renderCalendar();
     renderDayEditor(state.selectedCalendarDate);
+    closeSimpleDayAfterDurationSave(state.selectedCalendarDate);
   };
   manualCancelBtn.onclick = function () {
     dayDurationDraft = null;
@@ -13584,10 +13588,12 @@ function updateDeductionFormVisibility() {
     return parts.length ? parts.join(' ') : '0 days';
   }
 
-  // Banked leave = billable hours logged to date minus the contract's expected hours to date, where
-  // "expected" spreads total_hours across the contract's working days (weekends and, when loaded, public
-  // holidays excluded). Day-weighted rather than the monthly quota's even spread so the pace is honest
-  // across short and long months. Only capped, dated contracts active today participate.
+  // Banked leave = billable hours committed (worked to date plus prefilled future days) minus the quota
+  // owed so far. The quota is the Projected variance badge's monthly figure (total_hours ÷ pro-rated
+  // months): finished months owe it in full, and the current month owes the share of its business days
+  // already passed or prefilled. Public holidays are not removed from that month's day count, so like
+  // the badge a holiday-heavy month reads slightly behind. Holidays and marked leave are removed only
+  // from the forward-looking pace. Only capped, dated contracts active today participate.
   function buildLeaveBankSummary() {
     if (!getFeatureFlag('leave_balance_card')) return null;
     if (!getFeatureFlag('expected_monthly_hours')) return null;
@@ -13727,13 +13733,16 @@ function updateDeductionFormVisibility() {
     }
 
     const allowanceDays = getLeaveAllowanceDays();
+    // Days off are measured against the contract's own standard day when one contract is active; with
+    // several, the global target day is the only common unit.
+    const dayHours = rows.length === 1 ? rows[0].stdC : std;
     return {
       banked,
       rows,
       contractCount: rows.length,
-      std,
+      std: dayHours,
       allowanceDays,
-      allowanceHours: allowanceDays * std,
+      allowanceHours: allowanceDays * dayHours,
       leaveTypesConfigured: leaveIds.length > 0,
       takenLeaveHours,
       plannedLeaveHours
@@ -23486,7 +23495,8 @@ function getCachedIncomeSummary(monthKey) {
     const existingEntries = state.entries.filter(entry => entry.date === dateIso);
     openDayModal();
     // A targeted calendar marker/context row may expand an exact record, but only when the target resolves
-    // uniquely. Ordinary day clicks deliberately leave every row collapsed in the complete day view.
+    // uniquely. Ordinary day clicks leave every existing row collapsed; on a Simple-lead day they open
+    // the add-duration editor instead.
     let target = targetEntryId
       ? existingEntries.find((entry) => String(entry.id) === String(targetEntryId))
       : null;
@@ -23498,6 +23508,10 @@ function getCachedIncomeSummary(monthKey) {
     if (target) {
       if (resolveEntryType(target) === 'basic') beginDayDurationDraft(target);
       else if (entryPunches(target).length) enterDaySessionEdit(target.id, 0);
+    } else if (dayLeadEntryMode(dateIso) === 'simple') {
+      // Simple days open ready to type: the add editor is expanded with Total hours focused, so a
+      // number then Enter (or Add duration) logs the day.
+      beginDayDurationDraft(null);
     }
   }
 
@@ -24268,6 +24282,15 @@ function getCachedIncomeSummary(monthKey) {
   // The fixed-duration editor reuses the proven Basic form controls, but is mounted immediately beneath the
   // exact row being edited. Its snapshot lets close/switch guards distinguish a merely expanded row from a
   // genuinely dirty draft.
+  let dayDurationSaveKeepsDayOpen = false; // set while a section switch saves the draft
+  // Simple days are one-and-done: a duration save is already optimistic, so Enter or Save closes the day
+  // straight away. A save made only to switch sections keeps the day open.
+  function closeSimpleDayAfterDurationSave(dateIso) {
+    if (dayDurationSaveKeepsDayOpen || !isDayModalOpenFor(dateIso)) return false;
+    if (dayLeadEntryMode(dateIso) !== 'simple') return false;
+    closeDayModal();
+    return true;
+  }
   let dayDurationDraft = null; // { mode:'add'|'edit', entryId:'', initial:{hours,hourTypeId,contractId} }
 
   function captureDayDurationValues() {
@@ -24343,7 +24366,8 @@ function getCachedIncomeSummary(monthKey) {
           setStatus('Complete the duration entry before saving.', 'error');
           return false;
         }
-        manualSaveBtn.click();
+        dayDurationSaveKeepsDayOpen = true;
+        try { manualSaveBtn.click(); } finally { dayDurationSaveKeepsDayOpen = false; }
         // The click handler clears dayDurationDraft synchronously only after validation, duplicate checks,
         // and the optimistic write have all succeeded. If it is still present, keep this editor open rather
         // than treating a rejected save as permission to switch sections and lose the user's values.
@@ -24520,12 +24544,26 @@ function getCachedIncomeSummary(monthKey) {
     renderDayDurationEntries(dateIso);
     renderDayLevelActions(dateIso);
     updateDayClockToggle(dateIso);
-    // Simple-only days (Settings › Default entry mode = Simple, no contract/hour type overriding it, and no
-    // session already logged that day) show just Duration Entries — the setting promises "a single
-    // total-hours field". dayEntryModes() keeps Detailed on for any day that already holds a session, so
-    // nothing logged is ever hidden.
+    // A Simple-lead day puts Duration Entries first; a Detailed-lead day keeps Timed Sessions on top.
+    // Simple-only days (no contract/hour type wanting Detailed, no session already logged) hide Timed
+    // Sessions entirely — the setting promises "a single total-hours field". dayEntryModes() keeps
+    // Detailed on for any day that already holds a session, so nothing logged is ever hidden.
     const sessionsSection = document.querySelector('#modal-day-entry section[aria-labelledby="day-sessions-title"]');
+    const durationSection = document.querySelector('#modal-day-entry section[aria-labelledby="day-duration-title"]');
+    if (sessionsSection && durationSection && sessionsSection.parentNode === durationSection.parentNode) {
+      const parent = durationSection.parentNode;
+      if (dayLeadEntryMode(dateIso) === 'simple') parent.insertBefore(durationSection, sessionsSection);
+      else parent.insertBefore(sessionsSection, durationSection);
+    }
     if (sessionsSection) sessionsSection.style.display = dayEntryModes(dateIso).detailed ? '' : 'none';
+  }
+
+  // The section a day opens on: the only mode the day offers, or — when it offers both — Settings ›
+  // Default entry mode.
+  function dayLeadEntryMode(dateIso) {
+    const modes = dayEntryModes(dateIso);
+    if (!modes.both) return modes.detailed ? 'detailed' : 'simple';
+    return getGlobalDefaultEntryMode();
   }
 
   function daySessionsPendingKey(entryId, punchIndex) { return String(entryId) + '#' + punchIndex; }
@@ -27156,11 +27194,8 @@ function getCachedIncomeSummary(monthKey) {
       section: 'leave_balance_card',
       order: 95,
       element: () => leaveAllowanceDaysInput,
-      getValue: (el) => {
-        const v = Number(el.value);
-        return Number.isFinite(v) && v >= 0 ? v : DEFAULT_LEAVE_ALLOWANCE_DAYS;
-      },
-      setValue: (el, val) => { const v = Number(val); el.value = String(Number.isFinite(v) && v >= 0 ? v : DEFAULT_LEAVE_ALLOWANCE_DAYS); },
+      getValue: (el) => normalizeLeaveAllowanceDays(el.value),
+      setValue: (el, val) => { el.value = String(normalizeLeaveAllowanceDays(val)); },
       defaultValue: DEFAULT_LEAVE_ALLOWANCE_DAYS,
       event: 'input'
     },
