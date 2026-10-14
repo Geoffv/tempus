@@ -41,10 +41,13 @@
       <h3 style="margin:0;">BAS Reporting</h3>
       <p class="ts-note" style="margin:0;">Review invoiced income, company expenses, and payroll figures across the financial year.</p>
     </div>
-    <label class="ts-select-label">
-      Financial year
-      <select id="bas-fy-select" style="min-width:160px;"></select>
-    </label>
+    <div style="display:flex; align-items:flex-end; gap:12px; flex-wrap:wrap;">
+      <label class="ts-select-label">
+        Financial year
+        <select id="bas-fy-select" style="min-width:160px;"></select>
+      </label>
+      <button type="button" class="ghost" id="bas-accountant-report" title="Download the year's bookkeeping workbook (Income and Expenses by quarter) for your accountant">Export for accountant</button>
+    </div>
   </div>
   <div id="bas-quarterly-note" class="ts-note" style="display:none; margin-bottom:12px;">Quarterly totals shown (Q1 = Jul–Sep).</div>
   <div class="ts-empty-state" id="bas-empty" style="display:none;">

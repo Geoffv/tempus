@@ -50,6 +50,18 @@ function normalizePercentageDecimal_(value, fallback) {
   return Math.round(number * 1000000) / 1000000;
 }
 
+// How a payment was made, shown on the accountant report. Blank means not recorded (older payments).
+var PAYMENT_METHODS = ['EFT', 'Credit card', 'Debit card', 'Cash', 'Direct debit', 'BPAY', 'Other'];
+
+function normalizePaymentMethod_(value) {
+  var text = String(value == null ? '' : value).trim();
+  if (!text) return '';
+  for (var i = 0; i < PAYMENT_METHODS.length; i++) {
+    if (PAYMENT_METHODS[i].toLowerCase() === text.toLowerCase()) return PAYMENT_METHODS[i];
+  }
+  throw new Error('Payment method must be one of: ' + PAYMENT_METHODS.join(', ') + '.');
+}
+
 function roundMoney_(value) {
   var number = Number(value);
   if (!isFinite(number)) number = 0;

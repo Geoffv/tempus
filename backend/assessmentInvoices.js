@@ -178,8 +178,6 @@ function api_generateLilMonthlyInvoice(payload) {
         lines.push(Object.assign({}, line, { id: Utilities.getUuid(), invoice_id: invoice.id, generation_id: requestId, position: lines.length + 1, is_default: 'FALSE', line_date: row.assessment_date, hours: 0, amount_mode: 'amount', contract_id: row.contract_id, contract_name_snapshot: (assessmentContractById_(row.contract_id) || {}).name || '', timesheet_entry_id: billing.id, source_type: 'assessment', source_id: row.id, source_line_id: line.id, created_at: now, updated_at: now }));
       });
     });
-    var total = summarizeInvoiceLineItems(lines).totalWithGst, paid = invoicePaymentsForInvoice_(invoice.id).reduce(function(s,p) { return s + Number(p.amount || 0); },0);
-    if (paid > total + 0.005) { throw new Error('Historical payments exceed the replacement total. Reconcile that balance before replacing the invoice.'); }
     assessmentWrite_('invoices', invoice); clearInvoiceCaches();
     return { invoice: invoice, inputs: inputs, lines: lines };
   });

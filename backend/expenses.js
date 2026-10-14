@@ -172,7 +172,7 @@ function api_listExpenseTransactions(filters) {
   payments.forEach(function(payment) {
     var key = String(payment.expense_transaction_id);
     paid[key] = roundMoney_((paid[key] || 0) + Number(payment.amount || 0));
-    (byTransaction[key] = byTransaction[key] || []).push({ id: payment.id, payment_date: String(payment.payment_date || ''), amount: roundMoney_(payment.amount), reference: String(payment.reference || ''), notes: String(payment.notes || '') });
+    (byTransaction[key] = byTransaction[key] || []).push({ id: payment.id, payment_date: String(payment.payment_date || ''), amount: roundMoney_(payment.amount), reference: String(payment.reference || ''), notes: String(payment.notes || ''), payment_method: String(payment.payment_method || '') });
   });
   transactions.forEach(function(transaction) {
     transaction.paid_amount = paid[String(transaction.id)] || 0;
@@ -201,6 +201,7 @@ function api_upsertExpenseTransaction(payload) {
     if (payment) {
       if (normalized.status !== 'recorded') return apiRecoverableFailure_('scheduled_transaction', 'Only a recorded expense can be paid.');
       normalizeIsoDateStrict_(payment.payment_date, 'Payment date', false);
+      try { normalizePaymentMethod_(payment.payment_method); } catch (error) { return apiRecoverableFailure_('invalid_payment_method', error.message); }
       paymentAmount = payment.amount === undefined || payment.amount === '' ? roundMoney_(Number(normalized.amount) - alreadyPaid) : roundMoney_(payment.amount);
       if (paymentAmount > 0 && alreadyPaid + paymentAmount > Number(normalized.amount) + 0.005) return apiRecoverableFailure_('overpayment', 'Payment exceeds the remaining expense balance.', { balance_due: Math.max(0, roundMoney_(Number(normalized.amount) - alreadyPaid)) });
     }
@@ -210,7 +211,7 @@ function api_upsertExpenseTransaction(payload) {
     var result = { success: true, transaction: normalized };
     // A $0 expense (or one already paid in full) has nothing left to pay, so no payment row is written.
     if (paymentAmount > 0) {
-      var paid = api_addExpensePayment({ expense_transaction_id: normalized.id, payment_date: payment.payment_date, amount: paymentAmount, reference: payment.reference, notes: payment.notes });
+      var paid = api_addExpensePayment({ expense_transaction_id: normalized.id, payment_date: payment.payment_date, amount: paymentAmount, reference: payment.reference, notes: payment.notes, payment_method: payment.payment_method });
       if (paid.success === false) return paid;
       result.payment = paid.payment;
     }
@@ -242,10 +243,12 @@ function api_addExpensePayment(payload) {
     if (String(transaction.status) === 'scheduled') return apiRecoverableFailure_('scheduled_transaction', 'Record the scheduled expense before adding a payment.');
     var amount = roundMoney_(payload.amount);
     if (amount <= 0) return apiRecoverableFailure_('invalid_amount', 'Payment amount must be greater than zero.');
+    var method;
+    try { method = normalizePaymentMethod_(payload.payment_method); } catch (error) { return apiRecoverableFailure_('invalid_payment_method', error.message); }
     var data = expenseReadSheet_('expense_payments');
     var paid = data.rows.filter(function(item) { return String(item.expense_transaction_id) === String(transaction.id); }).reduce(function(sum, item) { return sum + Number(item.amount || 0); }, 0);
     if (paid + amount > Number(transaction.amount || 0) + 0.005) return apiRecoverableFailure_('overpayment', 'Payment exceeds the remaining expense balance.', { balance_due: Math.max(0, roundMoney_(Number(transaction.amount || 0) - paid)) });
-    var payment = { id: Utilities.getUuid(), expense_transaction_id: transaction.id, payment_date: normalizeIsoDateStrict_(payload.payment_date, 'Payment date', false), amount: amount, reference: String(payload.reference || ''), notes: String(payload.notes || ''), created_at: expenseNow_(), updated_at: expenseNow_() };
+    var payment = { id: Utilities.getUuid(), expense_transaction_id: transaction.id, payment_date: normalizeIsoDateStrict_(payload.payment_date, 'Payment date', false), amount: amount, reference: String(payload.reference || ''), notes: String(payload.notes || ''), payment_method: method, created_at: expenseNow_(), updated_at: expenseNow_() };
     data.sheet.appendRow(rowValuesFromObject_(data.headers, payment));
     cacheClearPrefix(EXPENSE_CACHE_PREFIX);
     return { success: true, payment: payment };

@@ -27,7 +27,8 @@
       <div class="ts-note" id="expense-paid-now-hint">Records a payment for the full amount. Turn off for a bill you haven't paid yet; it will show as Unpaid and won't count on a cash-basis BAS until you record the payment.</div>
       <div class="ts-grid ts-grid--gap-md" id="expense-paid-now-fields" style="margin-top:10px;">
         <div class="ts-col-span-4"><label for="expense-paid-date">Payment date</label><input id="expense-paid-date" type="date"></div>
-        <div class="ts-col-span-8"><label for="expense-paid-reference">Payment reference (optional)</label><input id="expense-paid-reference" maxlength="160" placeholder="e.g. bank transfer or card ref"></div>
+        <div class="ts-col-span-3"><label for="expense-paid-method">Paid by</label><select id="expense-paid-method"></select></div>
+        <div class="ts-col-span-5"><label for="expense-paid-reference">Payment reference (optional)</label><input id="expense-paid-reference" maxlength="160" placeholder="e.g. bank transfer or card ref"></div>
       </div>
     </div>
     <div style="display:flex; justify-content:flex-end; margin-top:14px;"><button type="submit">Save expense</button></div>
@@ -74,7 +75,7 @@
     <details><summary>Expenses: recording and paying</summary>
       <p><strong>A scheduled bill:</strong> choose <strong>Mark paid</strong> to record it and its payment in one step. Use <strong>Record as unpaid bill</strong> if it has arrived but isn't paid yet. Use <strong>Skip</strong> if it won't happen this time.</p>
       <p><strong>A one-off purchase:</strong> choose <strong>Record expense</strong>. Leave <strong>Paid now</strong> on to record the payment at the same time. Turn it off for a bill you'll pay later.</p>
-      <p>Each expense shows Paid, Part-paid or Unpaid and the amount outstanding. Use <strong>Record payment</strong> to pay what's owing, including in instalments. Payments are listed under the expense with their reference.</p>
+      <p>Each expense shows Paid, Part-paid or Unpaid and the amount outstanding. Use <strong>Record payment</strong> to pay what's owing, including in instalments. Payments are listed under the expense with how they were paid and their reference.</p>
       <p><strong>Fixing mistakes:</strong> <strong>Remove payment</strong> undoes a payment, and <strong>Edit</strong> corrects the details. <strong>Void</strong> keeps the expense for the record but leaves it out of every total. A reconciled expense is locked, so void it and record a correction instead.</p>
     </details>
     <details><summary>Expenses and GST</summary><p>On a cash basis an expense counts when it is paid, so an unpaid expense counts as $0. On an accrual basis it counts on its invoice or purchase date. A GST credit (BAS 1B) counts only after you add a receipt and <strong>Reconcile</strong> the expense with the GST credit claimed. Upcoming schedule payments are forecasts, never actuals. The dashboard, the BAS table and the BAS calculation all read company expenses from the Expenses page. The Deductions page is for salary sacrifice and extra super only.</p></details>

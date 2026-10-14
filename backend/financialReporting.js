@@ -30,10 +30,12 @@ function basPeriodRange_(payload) {
   return { from: Utilities.formatDate(start, 'UTC', 'yyyy-MM-dd'), to: Utilities.formatDate(end, 'UTC', 'yyyy-MM-dd') };
 }
 
-function invoiceAccrualAllocationForPeriod_(invoice, from, to) {
-  var payments = invoicePaymentsForInvoice_(invoice.id);
-  var eventDate = invoice.invoice_date;
-  if (payments.length && payments[0].payment_date < eventDate) eventDate = payments[0].payment_date;
+/**
+ * Every invoice is assumed paid, so its income counts in full on its invoice date under both accounting
+ * bases. Payments against invoices are not tracked.
+ */
+function invoiceIncomeForPeriod_(invoice, from, to) {
+  var eventDate = String(invoice.invoice_date || '');
   if (!eventDate || eventDate < from || eventDate > to || invoice.status === 'void' || invoice.status === 'draft') return { sales: 0, gst: 0 };
   var totals = summarizeInvoiceLineItems(listInvoiceLineItemsByInvoiceId(invoice.id));
   return { sales: totals.totalWithGst, gst: totals.gstAmount };
@@ -45,23 +47,30 @@ function expenseActualForPeriod_(basis, from, to, source) {
   var payments = source ? source.payments : expenseReadSheet_('expense_payments').rows;
   var totals = { purchases: 0, gst: 0 };
   transactions.forEach(function(transaction) {
-    if (String(transaction.status) === 'void' || String(transaction.status) === 'scheduled') return;
-    if (basis === 'accrual') {
-      var eventDate = String(transaction.supplier_invoice_date || transaction.purchase_date || '');
-      if (eventDate < from || eventDate > to) return;
-      totals.purchases += Number(transaction.amount) || 0;
-      totals.gst += expenseClaimableGst_(transaction);
-      return;
-    }
-    var transactionPayments = payments.filter(function(payment) { return String(payment.expense_transaction_id) === String(transaction.id) && payment.payment_date >= from && payment.payment_date <= to; });
-    var paid = transactionPayments.reduce(function(sum, payment) { return sum + Number(payment.amount || 0); }, 0);
-    var amount = Number(transaction.amount) || 0;
-    if (amount <= 0 || paid <= 0) return;
-    var ratio = Math.min(1, paid / amount);
-    totals.purchases += paid;
-    totals.gst += expenseClaimableGst_(transaction) * ratio;
+    var share = expenseAttributionForPeriod_(basis, from, to, transaction, payments);
+    totals.purchases += share.purchases;
+    totals.gst += share.gst;
   });
   return { purchases: roundMoney_(totals.purchases), gst: roundMoney_(totals.gst) };
+}
+
+/**
+ * One expense's share of a period, unrounded. Accrual counts the whole expense on its supplier invoice
+ * (else purchase) date; cash counts what was paid inside the period, with claimable GST in proportion.
+ * The BAS total above and the accountant report's line items both use it, so they cannot disagree.
+ */
+function expenseAttributionForPeriod_(basis, from, to, transaction, payments) {
+  if (String(transaction.status) === 'void' || String(transaction.status) === 'scheduled') return { purchases: 0, gst: 0 };
+  if (basis === 'accrual') {
+    var eventDate = String(transaction.supplier_invoice_date || transaction.purchase_date || '');
+    if (eventDate < from || eventDate > to) return { purchases: 0, gst: 0 };
+    return { purchases: Number(transaction.amount) || 0, gst: expenseClaimableGst_(transaction) };
+  }
+  var paid = payments.filter(function(payment) { return String(payment.expense_transaction_id) === String(transaction.id) && payment.payment_date >= from && payment.payment_date <= to; })
+    .reduce(function(sum, payment) { return sum + Number(payment.amount || 0); }, 0);
+  var amount = Number(transaction.amount) || 0;
+  if (amount <= 0 || paid <= 0) return { purchases: 0, gst: 0 };
+  return { purchases: paid, gst: expenseClaimableGst_(transaction) * Math.min(1, paid / amount) };
 }
 
 /**
@@ -136,7 +145,7 @@ function basActualsForRange_(basis, from, to) {
   var sales = 0, salesGst = 0;
   listInvoicesInternal().forEach(function(invoice) {
     if (invoice.status === 'void' || invoice.status === 'draft') return;
-    var allocation = basis === 'cash' ? invoiceCashAllocationForPeriod_(invoice, from, to) : invoiceAccrualAllocationForPeriod_(invoice, from, to);
+    var allocation = invoiceIncomeForPeriod_(invoice, from, to);
     sales += allocation.sales;
     salesGst += allocation.gst;
   });
@@ -155,16 +164,14 @@ function api_calculateBasPeriod(payload) {
   var transactions = api_listExpenseTransactions({ from: range.from, to: range.to });
   var unreconciled = transactions.filter(function(item) { return item.status !== 'void' && item.reconciliation_state !== 'reconciled'; });
   var missingReceipts = transactions.filter(function(item) { return item.status !== 'void' && item.gst_code === 'taxable' && (!item.attachments || !item.attachments.length); });
-  var unpaid = api_listInvoices({ include_summary: true }).filter(function(invoice) { return invoice.status !== 'void' && invoice.status !== 'draft' && invoice.payment_state !== 'paid' && invoice.invoice_date <= range.to; });
-  var source = { basis: basis, range: range, invoices: listInvoicesInternal(), invoice_payments: invoicePayments_(), expenses: transactions, expense_payments: expenseReadSheet_('expense_payments').rows };
+  var source = { basis: basis, range: range, invoices: listInvoicesInternal(), expenses: transactions, expense_payments: expenseReadSheet_('expense_payments').rows };
   var result = {
     success: true, accounting_basis: basis, period: range,
     actual: { g1_total_sales: roundMoney_(sales), gst_on_sales: roundMoney_(salesGst), purchases: expenses.purchases, gst_on_purchases: expenses.gst },
     forecast: { timesheet_income: forecastIncome.income, scheduled_expenses: forecastExpenses },
-    variance: { uninvoiced_time: forecastIncome.uninvoiced_time, unpaid_invoices: unpaid.reduce(function(sum, invoice) { return sum + Number(invoice.balance_due || 0); }, 0), unreconciled_expenses: unreconciled.reduce(function(sum, item) { return sum + Number(item.amount || 0); }, 0), missing_receipt_count: missingReceipts.length },
+    variance: { uninvoiced_time: forecastIncome.uninvoiced_time, unreconciled_expenses: unreconciled.reduce(function(sum, item) { return sum + Number(item.amount || 0); }, 0), missing_receipt_count: missingReceipts.length },
     warnings: []
   };
-  if (unpaid.length) result.warnings.push(unpaid.length + ' issued invoice(s) remain unpaid or part-paid.');
   if (unreconciled.length) result.warnings.push(unreconciled.length + ' expense(s) are excluded from GST credits until reconciled.');
   if (missingReceipts.length) result.warnings.push(missingReceipts.length + ' taxable expense(s) have no receipt attached.');
   result.source_hash = sha256Hex_(stableJsonStringify_(source));

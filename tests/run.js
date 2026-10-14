@@ -142,7 +142,7 @@ test('a fresh fork of a production sheet upgrades and then reads back without du
   load(context, 'backend/hourtypes.js');
   load(context, 'backend/contracts.js');
 
-  ['backend/entries.js','backend/integrity.js','backend/settings.js','backend/invoices.js','backend/invoiceLedger.js','backend/assessments.js','backend/assessmentInvoices.js'].forEach(file=>load(context,file));
+  ['backend/entries.js','backend/integrity.js','backend/settings.js','backend/invoices.js','backend/assessments.js','backend/assessmentInvoices.js'].forEach(file=>load(context,file));
   const upgrade = context.api_runUpgrade();
   assert.equal(upgrade.required, false, 'every migration should apply on a fresh fork');
   assert.equal(upgrade.state, 'complete');
@@ -398,49 +398,36 @@ test('importer validates calendar dates and represents full days without fake pu
   assert.deepStrictEqual(JSON.parse(JSON.stringify(context.buildPunchesForDuration(90))), [{ in: '00:00', out: '01:30' }]);
 });
 
-test('partial invoice payments allocate cash-basis GST proportionally', () => {
-  const { context } = createAppsScriptContext({});
-  context.cacheGet = () => null;
-  context.cacheSet = () => {};
-  context.getOrCreateSheet = () => ({ getDataRange: () => ({ getValues: () => [[]] }) });
-  context.rowObjectFromHeaders_ = () => ({});
-  context.roundMoney_ = (value) => Math.round((Number(value) + Number.EPSILON) * 100) / 100;
-  context.listInvoiceLineItemsByInvoiceId = () => [{ amount: 100, gst_amount: 10 }];
-  context.summarizeInvoiceLineItems = () => ({ totalWithGst: 110, gstAmount: 10 });
-  load(context, 'backend/invoiceLedger.js');
-  context.invoicePaymentsForInvoice_ = () => [{ payment_date: '2026-07-15', amount: 55 }, { payment_date: '2026-08-15', amount: 55 }];
-  const allocation = context.invoiceCashAllocationForPeriod_({ id: 'invoice-1' }, '2026-07-01', '2026-07-31');
-  assert.deepStrictEqual(JSON.parse(JSON.stringify(allocation)), { sales: 55, gst: 5 });
-});
-
-test('BAS fixtures separate cash, accrual, prepayment, void, and unreconciled GST', () => {
+test('BAS fixtures count invoices on their invoice date, and separate cash, accrual, void, and unreconciled GST', () => {
   const data = fixture('financial-cases');
   const { context } = createAppsScriptContext({});
   context.cacheGet = () => null; context.cacheSet = () => {}; context.cacheClearPrefix = () => {};
   context.rowObjectFromHeaders_ = () => ({});
   context.getOrCreateSheet = () => ({ getDataRange: () => ({ getValues: () => [[]] }) });
   context.roundMoney_ = (value) => Math.round((Number(value) + Number.EPSILON) * 100) / 100;
-  load(context, 'backend/invoiceLedger.js');
   load(context, 'backend/financialReporting.js');
   context.listInvoicesInternal = () => data.invoices;
   context.listInvoiceLineItemsByInvoiceId = (id) => data.invoice_lines[id] || [];
   context.listInvoiceLineItemsInternal = () => [];
   context.summarizeInvoiceLineItems = (lines) => ({ totalWithGst: lines.reduce((sum, line) => sum + line.amount + line.gst_amount, 0), gstAmount: lines.reduce((sum, line) => sum + line.gst_amount, 0) });
-  context.invoicePayments_ = () => data.invoice_payments;
-  context.invoicePaymentsForInvoice_ = (id) => data.invoice_payments.filter((payment) => payment.invoice_id === id).sort((a, b) => a.payment_date.localeCompare(b.payment_date));
   context.api_listExpenseTransactions = () => data.expenses;
   context.expenseReadSheet_ = (name) => ({ rows: name === 'expense_payments' ? data.expense_payments : [] });
   context.expenseClaimableGst_ = (expense) => expense.status !== 'void' && expense.reconciliation_state === 'reconciled' && expense.claimable_gst_confirmed === 'TRUE' && expense.gst_code === 'taxable' ? expense.gst_amount * expense.business_use_percentage : 0;
   context.api_listExpenseRules = () => [];
-  context.api_listInvoices = () => [{ id:'invoice-part', status:'issued', invoice_date:'2026-07-10', payment_state:'part_paid', balance_due:55 }];
   context.timesheetForecastForPeriod_ = () => ({ income: 0, uninvoiced_time: 0 });
   context.scheduledExpenseForecastForPeriod_ = () => 0;
   context.sha256Hex_ = () => 'fixture-hash';
   context.stableJsonStringify_ = JSON.stringify;
   const cash = context.api_calculateBasPeriod({ financial_year:2026, period_type:'monthly', month:6, accounting_basis:'cash' });
   const accrual = context.api_calculateBasPeriod({ financial_year:2026, period_type:'monthly', month:6, accounting_basis:'accrual' });
-  assert.deepStrictEqual(JSON.parse(JSON.stringify(cash.actual)), { g1_total_sales:275, gst_on_sales:25, purchases:105, gst_on_purchases:5 });
-  assert.deepStrictEqual(JSON.parse(JSON.stringify(accrual.actual)), { g1_total_sales:330, gst_on_sales:30, purchases:215, gst_on_purchases:10 });
+  // Every invoice is assumed paid: July's invoice counts in full on its date under both bases, August's
+  // invoice in August, and the void one never. Expenses still follow payments on a cash basis.
+  assert.deepStrictEqual(JSON.parse(JSON.stringify(cash.actual)), { g1_total_sales:110, gst_on_sales:10, purchases:105, gst_on_purchases:5 });
+  assert.deepStrictEqual(JSON.parse(JSON.stringify(accrual.actual)), { g1_total_sales:110, gst_on_sales:10, purchases:215, gst_on_purchases:10 });
+  const august = context.api_calculateBasPeriod({ financial_year:2026, period_type:'monthly', month:7, accounting_basis:'cash' });
+  assert.equal(august.actual.g1_total_sales, 220);
+  assert.ok(!('unpaid_invoices' in cash.variance), 'invoice payment status is not tracked');
+  assert.ok(!cash.warnings.some((warning) => /unpaid/i.test(warning)));
   assert.ok(accrual.warnings.some((warning) => warning.includes('excluded from GST credits')));
 });
 
@@ -1870,6 +1857,7 @@ require('./recurrence-dst').run(test);
 require('./leave-balance').run(test);
 require('./day-editor-mode').run(test);
 require('./day-editor-mode').runClose(test);
+require('./accountant-report').run(test);
 
 if (!process.exitCode) process.stdout.write('\n' + passed + ' tests passed.\n');
 

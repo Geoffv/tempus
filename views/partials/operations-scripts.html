@@ -1,5 +1,30 @@
 <script>
   const operationsState = { expenseTab:'transactions', transactions:[], rules:[], expenseEditId:'', expenseRuleEditId:'' };
+  // Mirrors PAYMENT_METHODS in backend/integrity.js.
+  const PAYMENT_METHOD_OPTIONS = ['EFT', 'Credit card', 'Debit card', 'Cash', 'Direct debit', 'BPAY', 'Other'];
+
+  function fillPaymentMethodSelect(select, value) {
+    if (select.options.length !== PAYMENT_METHOD_OPTIONS.length) {
+      select.replaceChildren(...PAYMENT_METHOD_OPTIONS.map((method) => new Option(method, method)));
+    }
+    select.value = PAYMENT_METHOD_OPTIONS.includes(value) ? value : PAYMENT_METHOD_OPTIONS[0];
+    return select;
+  }
+
+  // The method last used for this vendor, else the last one used at all, so it rarely needs picking.
+  function expenseDefaultPaymentMethod(vendor) {
+    const key = String(vendor || '').trim().toLowerCase();
+    let vendorLatest = null, anyLatest = null;
+    (operationsState.transactions || []).forEach((transaction) => {
+      (transaction.payments || []).forEach((payment) => {
+        if (!payment.payment_method) return;
+        const stamp = String(payment.payment_date || '');
+        if (!anyLatest || stamp >= anyLatest.stamp) anyLatest = { stamp, method: payment.payment_method };
+        if (key && String(transaction.vendor || '').trim().toLowerCase() === key && (!vendorLatest || stamp >= vendorLatest.stamp)) vendorLatest = { stamp, method: payment.payment_method };
+      });
+    });
+    return (vendorLatest || anyLatest || { method: PAYMENT_METHOD_OPTIONS[0] }).method;
+  }
 
   function operationsApi(name, ...args) {
     return new Promise((resolve, reject) => {
@@ -211,7 +236,7 @@
     (transaction.payments || []).forEach((payment) => {
       const line = document.createElement('div'); line.className = 'ts-ledger-row__detail ts-expense-subline';
       const text = document.createElement('span');
-      text.textContent = `Paid ${operationsMoney(payment.amount)} on ${expenseDateLabel(payment.payment_date)}` + (payment.reference ? ` · ref ${payment.reference}` : '') + (payment.notes ? ` · ${payment.notes}` : '');
+      text.textContent = `Paid ${operationsMoney(payment.amount)} on ${expenseDateLabel(payment.payment_date)}` + (payment.payment_method ? ` by ${payment.payment_method}` : '') + (payment.reference ? ` · ref ${payment.reference}` : '') + (payment.notes ? ` · ${payment.notes}` : '');
       line.appendChild(text);
       if (!locked) line.appendChild(expenseConfirmButton('Remove payment', 'Confirm remove', () => operationsApi('api_deleteExpensePayment', payment.id), 'Payment removed'));
       row.appendChild(line);
@@ -251,10 +276,11 @@
     const status = expensePaymentStatus(transaction);
     const heading = { markpaid:`Mark paid · ${operationsMoney(transaction.amount)}`, payment:`Record payment · ${operationsMoney(status.outstanding)} outstanding`, receipt:'Add receipt', reconcile:'Reconcile' }[mode];
     ledgerText(panel, 'ts-ledger-inline__title', heading);
-    let amount, date, reference, notes, url, claim, override;
+    let amount, date, method, reference, notes, url, claim, override;
     if (mode === 'payment') amount = expenseInlineField(panel, 'Amount paid', expenseInput('number', { min:'0.01', step:'0.01', required:true, value:String(status.outstanding) }));
     if (mode === 'payment' || mode === 'markpaid') {
       date = expenseInlineField(panel, 'Payment date', expenseInput('date', { required:true, value:expenseToday() }));
+      method = expenseInlineField(panel, 'Paid by', fillPaymentMethodSelect(document.createElement('select'), expenseDefaultPaymentMethod(transaction.vendor)));
       reference = expenseInlineField(panel, 'Reference (optional)', expenseInput('text', { maxLength:160, placeholder:'Bank or card ref' }));
       notes = expenseInlineField(panel, 'Notes (optional)', expenseInput('text', { maxLength:500 }), true);
     }
@@ -280,8 +306,8 @@
       event.preventDefault(); submit.disabled = true;
       try {
         let result;
-        if (mode === 'markpaid') result = await expenseSave('api_upsertExpenseTransaction', { ...transaction, status:'recorded', reconciliation_state:'unreconciled', payment:{ payment_date:date.value, reference:reference.value, notes:notes.value } }, 'Marked paid');
-        else if (mode === 'payment') result = await expenseSave('api_addExpensePayment', { expense_transaction_id:transaction.id, payment_date:date.value, amount:Number(amount.value), reference:reference.value, notes:notes.value }, 'Payment recorded');
+        if (mode === 'markpaid') result = await expenseSave('api_upsertExpenseTransaction', { ...transaction, status:'recorded', reconciliation_state:'unreconciled', payment:{ payment_date:date.value, payment_method:method.value, reference:reference.value, notes:notes.value } }, 'Marked paid');
+        else if (mode === 'payment') result = await expenseSave('api_addExpensePayment', { expense_transaction_id:transaction.id, payment_date:date.value, amount:Number(amount.value), payment_method:method.value, reference:reference.value, notes:notes.value }, 'Payment recorded');
         else if (mode === 'receipt') result = await expenseSave('api_attachExpenseReceipt', { expense_transaction_id:transaction.id, url:url.value, name:'Receipt' }, 'Receipt added');
         else {
           const payload = { id:transaction.id, claimable_gst_confirmed:!!(claim && claim.checked) };
@@ -405,6 +431,8 @@
     document.getElementById('expense-paid-now').checked = true;
     document.getElementById('expense-paid-date').value = expenseToday();
     document.getElementById('expense-paid-reference').value = '';
+    const methodSelect = fillPaymentMethodSelect(document.getElementById('expense-paid-method'), expenseDefaultPaymentMethod(item?.vendor));
+    delete methodSelect.dataset.touched;
     syncExpensePaidNow();
     form.querySelector('h4').textContent = item ? 'Edit expense' : 'Record expense';
     document.getElementById('expense-vendor').focus();
@@ -459,7 +487,7 @@
     const payload = { id:operationsState.expenseEditId || '', vendor:document.getElementById('expense-vendor').value, vendor_abn:document.getElementById('expense-abn').value, description:document.getElementById('expense-description').value, category:document.getElementById('expense-category').value, amount:Number(document.getElementById('expense-amount').value), gst_code:document.getElementById('expense-gst-code').value, business_use_percentage:Number(document.getElementById('expense-business-use').value), purchase_date:document.getElementById('expense-date').value, supplier_invoice_date:document.getElementById('expense-supplier-date').value, notes:document.getElementById('expense-notes').value };
     const editing = !!operationsState.expenseEditId;
     const paidNow = !editing && document.getElementById('expense-paid-now').checked;
-    if (paidNow) payload.payment = { payment_date:document.getElementById('expense-paid-date').value, reference:document.getElementById('expense-paid-reference').value };
+    if (paidNow) payload.payment = { payment_date:document.getElementById('expense-paid-date').value, payment_method:document.getElementById('expense-paid-method').value, reference:document.getElementById('expense-paid-reference').value };
     const submit = form.querySelector('button[type="submit"]');
     submit.disabled = true;
     try {
@@ -475,6 +503,12 @@
     }
   });
   document.getElementById('expense-paid-now')?.addEventListener('change', syncExpensePaidNow);
+  // Until the method is picked by hand, it follows the vendor being typed.
+  document.getElementById('expense-paid-method')?.addEventListener('change', (event) => { event.target.dataset.touched = '1'; });
+  document.getElementById('expense-vendor')?.addEventListener('change', (event) => {
+    const select = document.getElementById('expense-paid-method');
+    if (select && !select.dataset.touched) fillPaymentMethodSelect(select, expenseDefaultPaymentMethod(event.target.value));
+  });
   document.getElementById('expense-rule-form')?.addEventListener('submit', async (event) => {
     event.preventDefault();
     const form = event.currentTarget;
@@ -541,7 +575,7 @@
     try {
       const report=await operationsApi('api_calculateBasPeriod',payload);
       target.replaceChildren();
-      [['Actual sales',report.actual.g1_total_sales],['GST on sales',report.actual.gst_on_sales],['GST credits',report.actual.gst_on_purchases],['Timesheet forecast',report.forecast.timesheet_income],['Scheduled expenses',report.forecast.scheduled_expenses],['Unpaid invoices',report.variance.unpaid_invoices],['Unreconciled expenses',report.variance.unreconciled_expenses]].forEach(([label,value])=>{const item=document.createElement('div');ledgerText(item,'ts-ledger-row__meta',label);const strong=document.createElement('strong');strong.textContent=operationsMoney(value);item.appendChild(strong);target.appendChild(item);});
+      [['Actual sales',report.actual.g1_total_sales],['GST on sales',report.actual.gst_on_sales],['GST credits',report.actual.gst_on_purchases],['Timesheet forecast',report.forecast.timesheet_income],['Scheduled expenses',report.forecast.scheduled_expenses],['Unreconciled expenses',report.variance.unreconciled_expenses]].forEach(([label,value])=>{const item=document.createElement('div');ledgerText(item,'ts-ledger-row__meta',label);const strong=document.createElement('strong');strong.textContent=operationsMoney(value);item.appendChild(strong);target.appendChild(item);});
       document.getElementById('bas-ledger-period').textContent=`${report.period.from} to ${report.period.to} · ${report.accounting_basis} basis`;
       document.getElementById('bas-ledger-warnings').textContent=(report.warnings||[]).join(' ');
     } catch(error) {
@@ -626,6 +660,37 @@
     link.download=result.filename;
     link.click();
     URL.revokeObjectURL(link.href);
+  });
+
+  function downloadBase64File(base64, filename, mimeType) {
+    const bytes = Uint8Array.from(atob(base64), (char) => char.charCodeAt(0));
+    const link = document.createElement('a');
+    link.href = URL.createObjectURL(new Blob([bytes], { type: mimeType }));
+    link.download = filename;
+    link.click();
+    setTimeout(() => URL.revokeObjectURL(link.href), 1000);
+  }
+
+  document.getElementById('bas-accountant-report')?.addEventListener('click', async (event) => {
+    const button = event.currentTarget;
+    const fy = Number(state.basCurrentFy);
+    if (!fy || button.disabled) return;
+    const basisSelect = document.getElementById('bas-accounting-basis');
+    const basis = (basisSelect && basisSelect.value) || defaultAccountingBasis();
+    const label = button.textContent;
+    button.disabled = true;
+    button.textContent = 'Preparing…';
+    operationsStatus('Preparing the accountant report…', 'warn');
+    try {
+      const result = await operationsApi('api_exportAccountantReport', { financial_year: fy, accounting_basis: basis });
+      downloadBase64File(result.base64, result.filename, 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+      operationsStatus('Accountant report downloaded', 'success');
+    } catch (error) {
+      operationsStatus('Could not export the accountant report: ' + (error && error.message ? error.message : error), 'error');
+    } finally {
+      button.disabled = false;
+      button.textContent = label;
+    }
   });
 
   document.getElementById('bas-accounting-basis')?.addEventListener('change',async(event)=>{const write=beginSettingsWrite(['accounting_basis']);state.settings.accounting_basis=event.target.value;try{await operationsApi('api_updateSettings',{accounting_basis:event.target.value});}finally{write.settle();saveCache();}renderBasLedgerSummary();renderTransferSplit();refreshCompanyExpenseViews();});

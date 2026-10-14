@@ -447,14 +447,6 @@ function api_listInvoices(filters) {
   }
 
   var cloned = invoices.map(cloneInvoice);
-  var paymentSummary = invoicePaymentSummaryByInvoice_();
-  cloned.forEach(function(invoice) {
-    var paid = paymentSummary[invoice.id] || 0;
-    var total = invoiceLedgerTotal_(invoice.id);
-    invoice.paid_amount = paid;
-    invoice.balance_due = Math.max(0, roundMoney_(total - paid));
-    invoice.payment_state = paid <= 0 ? 'unpaid' : (paid + 0.005 >= total ? 'paid' : 'part_paid');
-  });
 
   if (includeSummary) {
     var allItems = listInvoiceLineItemsInternal().filter(function(item) {

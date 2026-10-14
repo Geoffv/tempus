@@ -279,6 +279,41 @@ exports.run = test => {
     assert.ok(!c.api_listExpenseTransactions({}).some(t => t.vendor === 'Nope'));
   });
 
+  test('payments record how they were paid, case-insensitively, and refuse unknown methods', () => {
+    const { context: c } = backend();
+    const expense = recordedExpense(c);
+    assert.equal(c.api_addExpensePayment({ expense_transaction_id: expense.id, amount: 100, payment_date: '2026-09-21', payment_method: 'credit CARD' }).payment.payment_method, 'Credit card');
+    const bad = c.api_addExpensePayment({ expense_transaction_id: expense.id, amount: 10, payment_date: '2026-09-22', payment_method: 'Cheque' });
+    assert.equal(bad.error, 'invalid_payment_method');
+    assert.equal(c.api_addExpensePayment({ expense_transaction_id: expense.id, amount: 20, payment_date: '2026-09-23' }).payment.payment_method, '', 'not recorded stays blank');
+    assert.deepStrictEqual(JSON.parse(JSON.stringify(paymentsFor(c, expense.id).payments.map(p => p.payment_method))), ['Credit card', '']);
+
+    const paidNow = c.api_upsertExpenseTransaction({ vendor: 'Adobe', purchase_date: '2026-09-20', amount: 79.99, gst_code: 'taxable', payment: { payment_date: '2026-09-20', payment_method: 'EFT' } });
+    assert.equal(paymentsFor(c, paidNow.transaction.id).payments[0].payment_method, 'EFT');
+    const refused = c.api_upsertExpenseTransaction({ vendor: 'Refused', purchase_date: '2026-09-20', amount: 10, payment: { payment_date: '2026-09-20', payment_method: 'IOU' } });
+    assert.equal(refused.error, 'invalid_payment_method');
+    assert.ok(!c.api_listExpenseTransactions({}).some(t => t.vendor === 'Refused'), 'a refused method writes nothing');
+  });
+
+  test('the payment method defaults to the vendor\'s last method, then the last used, then EFT', () => {
+    const client = { operationsState: { transactions: [] }, Option: function(text, value) { this.text = text; this.value = value; } };
+    vm.runInNewContext(operationsScripts.slice(operationsScripts.indexOf('  const PAYMENT_METHOD_OPTIONS'), operationsScripts.indexOf('  function operationsApi(')), client);
+    vm.runInNewContext('this.pick = expenseDefaultPaymentMethod;', client);
+    assert.equal(client.pick('Adobe'), 'EFT');
+    client.operationsState.transactions = [
+      { vendor: 'Adobe', payments: [{ payment_date: '2026-07-01', payment_method: 'Credit card' }, { payment_date: '2026-08-01', payment_method: '' }] },
+      { vendor: 'Landlord', payments: [{ payment_date: '2026-09-01', payment_method: 'Direct debit' }] }
+    ];
+    assert.equal(client.pick(' adobe '), 'Credit card', 'same vendor wins, ignoring case and spacing');
+    assert.equal(client.pick('Officeworks'), 'Direct debit', 'otherwise the most recent method');
+    assert.match(operationsScripts, /payment:\{ payment_date:date\.value, payment_method:method\.value/);
+    assert.match(operationsScripts, /api_addExpensePayment', \{ expense_transaction_id:transaction\.id, payment_date:date\.value, amount:Number\(amount\.value\), payment_method:method\.value/);
+    assert.match(operationsScripts, /payment_method:document\.getElementById\('expense-paid-method'\)\.value/);
+    const backendList = fs.readFileSync(path.join(root, 'backend/integrity.js'), 'utf8').match(/var PAYMENT_METHODS = (\[[^\]]*\]);/)[1];
+    const clientList = operationsScripts.match(/const PAYMENT_METHOD_OPTIONS = (\[[^\]]*\]);/)[1];
+    assert.equal(clientList, backendList, 'client and backend offer the same methods');
+  });
+
   test('marking a scheduled occurrence paid records it and its payment in one step', () => {
     const { context: c } = backend();
     const rule = c.api_upsertExpenseRule(rulePayload()).rule;

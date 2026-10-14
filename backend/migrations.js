@@ -1279,6 +1279,15 @@ function migrationLegacyAssessmentInvoices_() {
  * Every sheet is read once and written once. The whole-file safety net is the verified pre-upgrade
  * spreadsheet copy (ensureVerifiedUpgradeBackup_), so the archive records only affected rows — copying
  * whole sheets into it row by row made the upgrade take minutes on an ordinary spreadsheet. */
+/** Invoice payments are no longer tracked; this one-time adoption still honours rows an older release wrote. */
+function migrationInvoiceHasLegacyPayments_(invoiceId) {
+  var sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName('invoice_payments');
+  if (!sheet || sheet.getLastRow() < 2) return false;
+  var values = sheet.getDataRange().getValues();
+  var index = values[0].indexOf('invoice_id');
+  return index !== -1 && values.slice(1).some(function(row) { return String(row[index]) === String(invoiceId); });
+}
+
 function migrationLilAssessments_() {
   var migration = '2026-09-lil-assessments-mode';
   var props = PropertiesService.getScriptProperties();
@@ -1389,7 +1398,7 @@ function migrationLilAssessments_() {
   invoices.forEach(function(inv) {
     var ev = evidence[inv.id]; if (!ev) return;
     var overlap = invoices.some(function(other) { return other.id !== inv.id && ((evidence[other.id] && evidence[other.id].months.some(function(p) { return ev.months.indexOf(p)!==-1; })) || (other.kind === 'lil_assessment' && ev.months.indexOf(other.source_month)!==-1)); });
-    var canAdopt = ev.months.length === 1 && !overlap && ev.lines.length && ev.lines.every(function(l) { return l.source_type === 'assessment' && Number(l.amount)>0; }) && !invoicePaymentsForInvoice_(inv.id).length;
+    var canAdopt = ev.months.length === 1 && !overlap && ev.lines.length && ev.lines.every(function(l) { return l.source_type === 'assessment' && Number(l.amount)>0; }) && !migrationInvoiceHasLegacyPayments_(inv.id);
     var stored = invoiceData.rows.filter(function(row) { return String(row.id) === String(inv.id); })[0];
     if (stored) invoiceArchive.push(stored.__values);
     invoiceUpdates.push({id:inv.id,kind:canAdopt?'lil_assessment':inv.kind,source_month:ev.months.length===1?ev.months[0]:'',migration_warning:canAdopt?'':'Historical assessment invoices need reconciliation for '+ev.months.join(', ')+'. Records and payment references are preserved.'});

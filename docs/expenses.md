@@ -59,7 +59,7 @@ Every recorded expense shows its payment status:
 
 Each payment is listed under its expense with the date, amount, reference and notes. Receipts appear as links.
 
-To pay an unpaid or part-paid expense, choose **Record payment**. The amount defaults to what is still owing, and the date defaults to today. You can pay in instalments. A payment can't be more than the amount still owing.
+To pay an unpaid or part-paid expense, choose **Record payment**. The amount defaults to what is still owing, the date defaults to today, and **Paid by** defaults to how you last paid that vendor (EFT, credit card, debit card, cash, direct debit, BPAY or other). The method appears on the accountant report. You can pay in instalments. A payment can't be more than the amount still owing.
 
 ## Receipts and reconciling
 
