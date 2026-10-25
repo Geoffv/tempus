@@ -209,6 +209,21 @@
     </select>
    </div>
   </div>
+  <div class="ts-settings-item" data-setting-key="expense_creation" id="expense-creation-col">
+   <label class="ts-settings-label" for="set-expense-creation">
+    Expense creation
+   </label>
+   <div class="ts-note">
+    How far ahead each schedule's payments are listed on the Expenses page, ready to mark paid or edit. Payments are created when Tempus opens, including any due since it was last opened. Upcoming payments you have edited are always kept.
+   </div>
+   <div class="ts-settings-field ts-settings-control">
+    <select id="set-expense-creation">
+     <option value="on_date">On scheduled date</option>
+     <option value="month">For current month</option>
+     <option value="financial_year">For financial year</option>
+    </select>
+   </div>
+  </div>
   <div class="ts-settings-item" data-setting-key="payg_instalment_rate" id="payg-rate-col">
    <label class="ts-settings-label" for="set-payg-rate">
     PAYG instalment rate (%)
