@@ -93,30 +93,64 @@ function expenseAttributionForPeriod_(basis, from, to, transaction) {
  * each with its amount including and excluding GST, its GST credit and what it takes off income (the
  * amount less its credit). `month` is the calendar month index (0-11). The total counted is the figure
  * api_getCompanyExpenseMonthlyTotals gives the dashboard for that month, so the two always agree.
+ * `pending` lists the month's payments that don't count yet, shown apart and never in the totals: schedule
+ * payments due in the month, and unpaid expenses invoiced in it that the basis doesn't count (cash basis).
  */
 function api_getCompanyExpensesForMonth(payload) {
   var year = Number(payload && payload.year);
   var month = Number(payload && payload.month);
   if (!isFinite(year) || !isFinite(month) || month < 0 || month > 11) throw new Error('Year and month are required.');
   var basis = payload && payload.accounting_basis === 'accrual' ? 'accrual' : 'cash';
-  var from = year + '-' + ('0' + (month + 1)).slice(-2) + '-01';
-  var to = year + '-' + ('0' + (month + 1)).slice(-2) + '-' + ('0' + new Date(Date.UTC(year, month + 1, 0, 12)).getUTCDate()).slice(-2);
+  var key = year + '-' + ('0' + (month + 1)).slice(-2);
+  var result = companyExpensesBreakdown_(basis, key, api_listExpenseTransactions({}), null);
+  result.success = true;
+  result.accounting_basis = basis;
+  return result;
+}
+
+// What the Company expenses breakdown and the expense form need from each expense, so the breakdowns sent
+// with the monthly totals stay small (no attachments or timestamps).
+var COMPANY_EXPENSE_BREAKDOWN_FIELDS_ = ['id', 'status', 'vendor', 'vendor_abn', 'description', 'category_id', 'category', 'category_color', 'gst_code',
+  'gst_amount', 'amount', 'amount_ex_gst', 'business_use_percentage', 'supplier_invoice_date', 'paid_date', 'payment_method', 'payment_reference', 'notes', 'source_rule_id'];
+
+/**
+ * One calendar month ('YYYY-MM') of company expenses on a basis: the expenses it counts (with counted_date,
+ * gst_credit and counted, what each takes off income), their totals, and the payments not counted yet
+ * (schedule payments due in the month, and unpaid expenses invoiced in it that the basis doesn't count).
+ * `fields` limits each item to those keys; null keeps every field.
+ */
+function companyExpensesBreakdown_(basis, key, transactions, fields) {
+  var from = key + '-01';
+  var parts = key.split('-').map(Number);
+  var to = key + '-' + ('0' + new Date(Date.UTC(parts[0], parts[1], 0, 12)).getUTCDate()).slice(-2);
+  var copy = function(transaction) {
+    var item = {};
+    (fields || Object.keys(transaction)).forEach(function(name) { if (transaction[name] !== undefined) item[name] = transaction[name]; });
+    return item;
+  };
   var items = [];
-  api_listExpenseTransactions({}).forEach(function(transaction) {
+  var pending = [];
+  transactions.forEach(function(transaction) {
     var share = expenseAttributionForPeriod_(basis, from, to, transaction);
     var date = expenseAttributionDate_(basis, transaction);
-    if (!date || date < from || date > to) return;
-    var item = {};
-    Object.keys(transaction).forEach(function(key) { item[key] = transaction[key]; });
+    if (!date || date < from || date > to) {
+      var due = String(transaction.supplier_invoice_date || '');
+      var waiting = String(transaction.status) === 'scheduled' || (expenseIsRecorded_(transaction) && !expenseIsPaid_(transaction));
+      if (waiting && due >= from && due <= to) pending.push(copy(transaction));
+      return;
+    }
+    var item = copy(transaction);
     item.counted_date = date;
     item.gst_credit = roundMoney_(share.gst);
     item.counted = roundMoney_(share.purchases - share.gst);
     items.push(item);
   });
   items.sort(function(a, b) { return a.counted_date.localeCompare(b.counted_date) || String(a.vendor).localeCompare(String(b.vendor)); });
-  var sum = function(key) { return roundMoney_(items.reduce(function(total, item) { return total + (Number(item[key]) || 0); }, 0)); };
-  return { success: true, accounting_basis: basis, from: from, to: to, expenses: items,
-    totals: { amount: sum('amount'), amount_ex_gst: sum('amount_ex_gst'), gst_credit: sum('gst_credit'), counted: roundMoney_(sum('amount') - sum('gst_credit')) } };
+  pending.sort(function(a, b) { return String(a.supplier_invoice_date).localeCompare(String(b.supplier_invoice_date)) || String(a.vendor).localeCompare(String(b.vendor)); });
+  var sum = function(name, list) { return roundMoney_((list || items).reduce(function(total, item) { return total + (Number(item[name]) || 0); }, 0)); };
+  return { from: from, to: to, expenses: items,
+    totals: { amount: sum('amount'), amount_ex_gst: sum('amount_ex_gst'), gst_credit: sum('gst_credit'), counted: roundMoney_(sum('amount') - sum('gst_credit')) },
+    pending: pending, pending_totals: { amount: sum('amount', pending), amount_ex_gst: sum('amount_ex_gst', pending) } };
 }
 
 /**
@@ -127,11 +161,15 @@ function api_getCompanyExpensesForMonth(payload) {
 function api_getCompanyExpenseMonthlyTotals() {
   var source = { transactions: api_listExpenseTransactions({}) };
   var months = {};
+  var breakdownMonths = {};
   source.transactions.forEach(function(transaction) {
     ['cash', 'accrual'].forEach(function(basis) {
       var date = expenseAttributionDate_(basis, transaction);
-      if (/^\d{4}-\d{2}/.test(date)) months[date.substring(0, 7)] = true;
+      if (/^\d{4}-\d{2}/.test(date)) months[date.substring(0, 7)] = breakdownMonths[date.substring(0, 7)] = true;
     });
+    // Months with only payments not counted yet still get a breakdown.
+    var due = String(transaction.supplier_invoice_date || '');
+    if (/^\d{4}-\d{2}/.test(due) && String(transaction.status) !== 'skipped') breakdownMonths[due.substring(0, 7)] = true;
   });
   var result = { cash: {}, accrual: {} };
   Object.keys(months).sort().forEach(function(key) {
@@ -144,7 +182,15 @@ function api_getCompanyExpenseMonthlyTotals() {
       if (totals.purchases || totals.gst) result[basis][key] = totals;
     });
   });
-  return { success: true, months: result, hash: sha256Hex_(JSON.stringify(result)).substring(0, 16) };
+  // Each month's Company expenses breakdown, so the Time Entry popup opens from memory with no server call.
+  var breakdowns = { cash: {}, accrual: {} };
+  Object.keys(breakdownMonths).sort().forEach(function(key) {
+    ['cash', 'accrual'].forEach(function(basis) {
+      var breakdown = companyExpensesBreakdown_(basis, key, source.transactions, COMPANY_EXPENSE_BREAKDOWN_FIELDS_);
+      if (breakdown.expenses.length || breakdown.pending.length) breakdowns[basis][key] = breakdown;
+    });
+  });
+  return { success: true, months: result, breakdowns: breakdowns, hash: sha256Hex_(JSON.stringify(result)).substring(0, 16) };
 }
 
 function timesheetForecastForPeriod_(from, to) {

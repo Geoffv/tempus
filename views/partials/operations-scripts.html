@@ -78,15 +78,17 @@
   }
 
   function loadCompanyExpenseLedgerTotals(options) {
-    ensureExpenseOccurrences();
+    const ensured = ensureExpenseOccurrences();
     if (companyExpenseLedgerLoad) return companyExpenseLedgerLoad;
     if (state.companyExpenseLedgerLoaded && !(options && options.force)) return Promise.resolve(state.companyExpenseLedger);
-    companyExpenseLedgerLoad = operationsApi('api_getCompanyExpenseMonthlyTotals').then((result) => {
+    // After any schedule payments due are created, so the breakdowns list them.
+    companyExpenseLedgerLoad = ensured.then(() => operationsApi('api_getCompanyExpenseMonthlyTotals')).then((result) => {
       const changed = !state.companyExpenseLedger || state.companyExpenseLedger.hash !== result.hash;
-      state.companyExpenseLedger = { months:result.months || { cash:{}, accrual:{} }, hash:result.hash || '' };
+      state.companyExpenseLedger = { months:result.months || { cash:{}, accrual:{} }, breakdowns:result.breakdowns || null, hash:result.hash || '' };
       state.companyExpenseLedgerLoaded = true;
       try { localStorage.setItem(COMPANY_EXPENSE_LEDGER_CACHE_KEY, JSON.stringify(state.companyExpenseLedger)); } catch (error) { /* non-fatal */ }
       if (changed) refreshCompanyExpenseViews();
+      refreshOpenCompanyExpensesModal();
       return state.companyExpenseLedger;
     }).catch((error) => {
       operationsStatus('Could not load company expenses for income figures: ' + (error && error.message ? error.message : error), 'warn');
@@ -114,15 +116,21 @@
   // Feature flags can be applied (from cache) before this script has loaded, so start the load here too.
   if (typeof state !== 'undefined' && state.companyTrackingEnabled) loadCompanyExpenseLedgerTotals();
 
-  async function renderExpensesPage() {
+  // The Expenses page load in progress (or last finished), so other screens can wait for its lists.
+  function renderExpensesPage() {
+    operationsState.pageLoad = loadExpensesPage();
+    return operationsState.pageLoad;
+  }
+
+  async function loadExpensesPage() {
     const list = document.getElementById('expense-transactions');
     if (!list) return;
     list.replaceChildren(ledgerText(document.createDocumentFragment(), '', ''));
     list.textContent = 'Loading expense ledger…';
     try {
       await ensureExpenseOccurrences();
-      const filters={from:document.getElementById('expense-filter-from')?.value||'',to:document.getElementById('expense-filter-to')?.value||'',status:document.getElementById('expense-filter-state')?.value||''};
-      const [transactions, rules, categories] = await Promise.all([operationsApi('api_listExpenseTransactions', filters), operationsApi('api_listExpenseRules', { include_inactive:true }), operationsApi('api_getDeductionCategories')]);
+      // Everything, once: the filters work on this list in the browser.
+      const [transactions, rules, categories] = await Promise.all([operationsApi('api_listExpenseTransactions', {}), operationsApi('api_listExpenseRules', { include_inactive:true }), operationsApi('api_getDeductionCategories')]);
       operationsState.transactions = transactions || [];
       operationsState.rules = rules || [];
       setExpenseCategories(categories);
@@ -276,47 +284,240 @@
     return result;
   }
 
+  // ----- Ledger filters, views and groups -------------------------------------------------------------------
+  // The page loads every expense once and filters in the browser, so changing a filter is instant.
+
   // Upcoming schedule payments this far ahead are listed straight away; the rest sit behind "Show all".
+  // Only with "All dates": a chosen month or financial year lists everything in it.
   const EXPENSE_UPCOMING_WINDOW_DAYS = 45;
+  const EXPENSE_LEDGER_PREFS_KEY = 'tempus_expense_ledger_prefs_v1';
+  const EXPENSE_UNCATEGORISED = '__none__';
+
+  function expenseLedgerPrefs() {
+    if (!operationsState.ledgerPrefs) {
+      let saved = null;
+      try { saved = JSON.parse(localStorage.getItem(EXPENSE_LEDGER_PREFS_KEY) || 'null'); } catch (error) { saved = null; }
+      operationsState.ledgerPrefs = { view:saved && saved.view === 'date' ? 'date' : 'grouped', folded:Object.assign({ upcoming:false, recorded:false, skipped:true }, saved && saved.folded) };
+    }
+    return operationsState.ledgerPrefs;
+  }
+
+  function saveExpenseLedgerPrefs() {
+    try { localStorage.setItem(EXPENSE_LEDGER_PREFS_KEY, JSON.stringify(expenseLedgerPrefs())); } catch (error) { /* per-browser convenience only */ }
+  }
+
+  function expenseLedgerFilter() {
+    if (!operationsState.ledgerFilter) operationsState.ledgerFilter = { month:'', status:'', category:'' };
+    return operationsState.ledgerFilter;
+  }
+
+  /**
+   * The date an expense sits under in the ledger's month filter, by the accounting basis, so a month here
+   * holds the same expenses as the Time Entry "Company expenses" popup: cash, the paid date; accrual, the
+   * earlier of invoice and paid date. Anything not counted yet (unpaid on cash, schedule payments, skipped)
+   * sits under its invoice or due date.
+   */
+  function expenseLedgerDate(transaction) {
+    const due = String(transaction.supplier_invoice_date || '');
+    if (transaction.status === 'scheduled' || transaction.status === 'skipped') return due;
+    const paid = String(transaction.paid_date || '');
+    if (defaultAccountingBasis() === 'accrual' && paid && due) return paid < due ? paid : due;
+    return paid || due;
+  }
+
+  /** due | upcoming | unpaid | paid | skipped, as the badges and the Status filter name them. */
+  function expenseLedgerStatus(transaction) {
+    const status = expensePaymentStatus(transaction);
+    if (status.key === 'scheduled') return status.label === 'Due' ? 'due' : 'upcoming';
+    return status.key;
+  }
+
+  function expenseMonthKey(year, monthIndex) {
+    const date = new Date(year, monthIndex, 1);
+    return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}`;
+  }
+
+  function expenseMonthLabel(key) {
+    const [year, month] = key.split('-').map(Number);
+    return new Date(year, month - 1, 1).toLocaleDateString('en-AU', { month:'long', year:'numeric' });
+  }
+
+  /** The current Australian financial year as from/to month keys (July to June). */
+  function expenseFinancialYearMonths() {
+    const today = expenseToday();
+    const year = Number(today.slice(0, 4)), month = Number(today.slice(5, 7));
+    const start = month >= 7 ? year : year - 1;
+    return { from:`${start}-07`, to:`${start + 1}-06`, label:`This financial year (Jul ${start} – Jun ${start + 1})` };
+  }
+
+  function expenseLedgerMatches(transaction, filter) {
+    const date = expenseLedgerDate(transaction);
+    if (filter.month === 'fy') {
+      const fy = expenseFinancialYearMonths();
+      if (!(date.slice(0, 7) >= fy.from && date.slice(0, 7) <= fy.to)) return false;
+    } else if (filter.month && date.slice(0, 7) !== filter.month) return false;
+    if (filter.status && expenseLedgerStatus(transaction) !== filter.status) return false;
+    if (filter.category === EXPENSE_UNCATEGORISED) { if (transaction.category_id) return false; }
+    else if (filter.category && transaction.category_id !== filter.category) return false;
+    return true;
+  }
+
+  /** Fills the month, status and category controls from the loaded expenses and the current filter. */
+  function renderExpenseLedgerFilters() {
+    const filter = expenseLedgerFilter();
+    const monthSelect = document.getElementById('expense-filter-month');
+    if (monthSelect) {
+      const months = new Set(operationsState.transactions.map((item) => expenseLedgerDate(item).slice(0, 7)).filter((key) => /^\d{4}-\d{2}$/.test(key)));
+      months.add(expenseToday().slice(0, 7));
+      if (/^\d{4}-\d{2}$/.test(filter.month)) months.add(filter.month);
+      const options = [new Option('All dates', ''), new Option(expenseFinancialYearMonths().label, 'fy')]
+        .concat(Array.from(months).sort().reverse().map((key) => new Option(expenseMonthLabel(key), key)));
+      monthSelect.replaceChildren(...options);
+      monthSelect.value = filter.month;
+    }
+    const statusSelect = document.getElementById('expense-filter-state');
+    if (statusSelect) statusSelect.value = filter.status;
+    const categorySelect = document.getElementById('expense-filter-category');
+    if (categorySelect) {
+      categorySelect.replaceChildren(new Option('All categories', ''), ...operationsState.categories.map((item) => new Option(item.name, item.id)), new Option('Uncategorised', EXPENSE_UNCATEGORISED));
+      categorySelect.value = filter.category;
+      if (categorySelect.value !== filter.category) { filter.category = ''; categorySelect.value = ''; }
+    }
+    const clear = document.getElementById('expense-filter-clear');
+    if (clear) clear.hidden = !(filter.month || filter.status || filter.category);
+    const view = expenseLedgerPrefs().view;
+    document.querySelectorAll('[data-expense-view]').forEach((button) => {
+      const active = button.dataset.expenseView === view;
+      button.classList.toggle('is-active', active);
+      button.setAttribute('aria-pressed', String(active));
+    });
+  }
+
+  function setExpenseLedgerFilter(changes) {
+    Object.assign(expenseLedgerFilter(), changes);
+    operationsState.showAllUpcoming = false;
+    renderExpenseTransactions();
+  }
+
+  /** Steps the month filter; from "All dates" or the financial year it starts at the current month. */
+  function stepExpenseLedgerMonth(delta) {
+    const filter = expenseLedgerFilter();
+    const base = /^\d{4}-\d{2}$/.test(filter.month) ? filter.month : expenseToday().slice(0, 7);
+    const [year, month] = base.split('-').map(Number);
+    setExpenseLedgerFilter({ month:/^\d{4}-\d{2}$/.test(filter.month) ? expenseMonthKey(year, month - 1 + delta) : base });
+  }
+
+  /** Opens the Expenses ledger filtered to one month (from the Time Entry "Company expenses" popup). */
+  function showExpenseLedgerMonth(year, monthIndex) {
+    operationsState.ledgerFilter = { month:expenseMonthKey(year, monthIndex), status:'', category:'' };
+    operationsState.showAllUpcoming = false;
+    const tab = document.querySelector('[data-expense-tab="transactions"]');
+    if (tab && operationsState.expenseTab !== 'transactions') tab.click();
+  }
+
+  function expenseCountsTowardSpend(transaction) {
+    if (transaction.status === 'scheduled' || transaction.status === 'skipped') return false;
+    return defaultAccountingBasis() === 'accrual' ? !!(transaction.paid_date || transaction.supplier_invoice_date) : !!transaction.paid_date;
+  }
+
+  /** "4 counted · $3,882.92 inc GST · $3,530.12 ex GST" and what isn't counted yet, for what's shown. */
+  function renderExpenseLedgerSummary(items) {
+    const summary = document.getElementById('expense-summary');
+    if (!summary) return;
+    summary.replaceChildren();
+    const active = items.filter((item) => item.status !== 'skipped');
+    if (!active.length) return;
+    const counted = active.filter(expenseCountsTowardSpend), waiting = active.filter((item) => !expenseCountsTowardSpend(item));
+    const sum = (list, key) => list.reduce((total, item) => total + (Number(item[key]) || 0), 0);
+    const exOf = (item) => (item.amount_ex_gst !== '' && item.amount_ex_gst != null ? item.amount_ex_gst : expenseExFromInc(item.amount, item.gst_code));
+    const part = (label, list, strong) => {
+      const span = document.createElement('span'); span.className = 'ts-expense-summary__part';
+      const lead = document.createElement(strong ? 'strong' : 'span'); lead.textContent = label;
+      span.append(lead, ` · ${operationsMoney(sum(list, 'amount'))} inc GST · ${operationsMoney(list.reduce((total, item) => total + (Number(exOf(item)) || 0), 0))} ex GST`);
+      summary.appendChild(span);
+    };
+    if (counted.length) part(`${counted.length} counted`, counted, true);
+    if (waiting.length) part(`${waiting.length} not counted yet`, waiting, false);
+  }
+
+  const EXPENSE_CHEVRON_SVG = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="6 9 12 15 18 9"/></svg>';
+
+  /** A foldable group heading: name, count and total, with the schedule-accordion chevron. */
+  function expenseLedgerGroupHead(list, key, label, items) {
+    const folded = !!expenseLedgerPrefs().folded[key];
+    const heading = ledgerText(list, 'ts-ledger-group', '');
+    heading.classList.add('ts-ledger-group--toggle');
+    const toggle = document.createElement('button');
+    toggle.type = 'button'; toggle.className = 'ts-ledger-group__toggle';
+    toggle.setAttribute('aria-expanded', String(!folded));
+    ledgerText(toggle, '', label);
+    ledgerText(toggle, 'ts-ledger-group__count', `${items.length} · ${operationsMoney(items.reduce((total, item) => total + (Number(item.amount) || 0), 0))}`);
+    const chev = document.createElement('span'); chev.className = 'ts-ded-group-chev'; chev.innerHTML = EXPENSE_CHEVRON_SVG;
+    toggle.appendChild(chev);
+    toggle.addEventListener('click', () => { const prefs = expenseLedgerPrefs(); prefs.folded[key] = !prefs.folded[key]; saveExpenseLedgerPrefs(); renderExpenseTransactions(); });
+    heading.appendChild(toggle);
+    return !folded;
+  }
 
   function renderExpenseTransactions() {
     const list = document.getElementById('expense-transactions');
     list.replaceChildren();
-    const visible = operationsState.transactions.filter((item) => item.status !== 'skipped');
-    const skipped = operationsState.transactions.filter((item) => item.status === 'skipped').sort((a, b) => String(b.supplier_invoice_date).localeCompare(String(a.supplier_invoice_date)));
-    if (!visible.length && !skipped.length) {
+    renderExpenseLedgerFilters();
+    if (!operationsState.transactions.length) {
+      renderExpenseLedgerSummary([]);
       ledgerText(list, 'ts-empty', 'No expenses yet. Use Record expense for a one-off purchase, or add a schedule for bills that repeat.');
       return;
     }
-    // Forecasts and real spending are kept apart: due and upcoming schedule payments first (soonest first),
-    // then everything recorded (newest first), so a year of forecasts never buries what was actually bought.
-    const upcoming = visible.filter((item) => item.status === 'scheduled').sort((a, b) => String(a.supplier_invoice_date).localeCompare(String(b.supplier_invoice_date)));
-    const recorded = visible.filter((item) => item.status !== 'scheduled');
-    if (upcoming.length) {
+    const filter = expenseLedgerFilter();
+    const shown = operationsState.transactions.filter((item) => expenseLedgerMatches(item, filter));
+    renderExpenseLedgerSummary(shown);
+    if (!shown.length) {
+      const empty = ledgerText(list, 'ts-empty', 'No expenses match these filters. ');
+      const clear = document.createElement('button'); clear.type = 'button'; clear.className = 'ts-expense-text-button'; clear.textContent = 'Clear filters';
+      clear.addEventListener('click', () => setExpenseLedgerFilter({ month:'', status:'', category:'' }));
+      empty.appendChild(clear);
+      return;
+    }
+    const byDateDesc = (a, b) => expenseLedgerDate(b).localeCompare(expenseLedgerDate(a));
+    if (expenseLedgerPrefs().view === 'date') { renderExpenseLedgerByDate(list, shown.slice().sort(byDateDesc)); return; }
+
+    // Grouped: forecasts and real spending kept apart. Due and upcoming schedule payments first (soonest first),
+    // then everything recorded (newest first), then skipped. Every group folds; the choice is remembered.
+    const upcoming = shown.filter((item) => item.status === 'scheduled').sort((a, b) => String(a.supplier_invoice_date).localeCompare(String(b.supplier_invoice_date)));
+    const recorded = shown.filter((item) => item.status !== 'scheduled' && item.status !== 'skipped').sort(byDateDesc);
+    const skipped = shown.filter((item) => item.status === 'skipped').sort(byDateDesc);
+    if (upcoming.length && expenseLedgerGroupHead(list, 'upcoming', 'Due and upcoming', upcoming)) {
       const cutoff = new Date(); cutoff.setDate(cutoff.getDate() + EXPENSE_UPCOMING_WINDOW_DAYS);
       const cutoffIso = `${cutoff.getFullYear()}-${String(cutoff.getMonth() + 1).padStart(2, '0')}-${String(cutoff.getDate()).padStart(2, '0')}`;
-      const soon = operationsState.showAllUpcoming ? upcoming : upcoming.filter((item) => String(item.supplier_invoice_date) <= cutoffIso);
-      ledgerText(list, 'ts-ledger-group', 'Due and upcoming');
+      const windowed = !filter.month && !operationsState.showAllUpcoming;
+      const soon = windowed ? upcoming.filter((item) => String(item.supplier_invoice_date) <= cutoffIso) : upcoming;
       soon.forEach((transaction) => renderExpenseTransactionRow(list, transaction));
       if (!soon.length) ledgerText(list, 'ts-ledger-row__detail ts-ledger-group__empty', `Nothing due in the next ${EXPENSE_UPCOMING_WINDOW_DAYS} days.`);
-      if (upcoming.length > soon.length || operationsState.showAllUpcoming) {
+      if (!filter.month && (upcoming.length > soon.length || operationsState.showAllUpcoming)) {
         const more = expenseActionButton(operationsState.showAllUpcoming ? 'Show only the next ' + EXPENSE_UPCOMING_WINDOW_DAYS + ' days' : `Show all ${upcoming.length} upcoming`, () => { operationsState.showAllUpcoming = !operationsState.showAllUpcoming; renderExpenseTransactions(); });
         more.classList.add('ts-ledger-group__more');
         list.appendChild(more);
       }
     }
-    ledgerText(list, 'ts-ledger-group', 'Recorded');
-    if (!recorded.length) ledgerText(list, 'ts-ledger-row__detail ts-ledger-group__empty', 'Nothing recorded yet. Mark an upcoming payment paid, or use Record expense.');
-    recorded.forEach((transaction) => renderExpenseTransactionRow(list, transaction));
-    // Skipped schedule payments sit in their own group, folded until opened, newest first.
-    if (skipped.length) {
-      const head = expenseActionButton(`${operationsState.showSkipped ? 'Hide' : 'Show'} skipped (${skipped.length})`, () => { operationsState.showSkipped = !operationsState.showSkipped; renderExpenseTransactions(); });
-      head.classList.add('ts-ledger-group__more');
-      head.setAttribute('aria-expanded', String(!!operationsState.showSkipped));
-      ledgerText(list, 'ts-ledger-group', 'Skipped');
-      list.appendChild(head);
-      if (operationsState.showSkipped) skipped.forEach((transaction) => renderExpenseTransactionRow(list, transaction));
-    }
+    if (recorded.length && expenseLedgerGroupHead(list, 'recorded', 'Recorded', recorded)) recorded.forEach((transaction) => renderExpenseTransactionRow(list, transaction));
+    // Skipped schedule payments, folded by default, so they can be restored.
+    if (skipped.length && expenseLedgerGroupHead(list, 'skipped', 'Skipped', skipped)) skipped.forEach((transaction) => renderExpenseTransactionRow(list, transaction));
+  }
+
+  /** One list in date order (newest first) under month headings with each month's count and total. */
+  function renderExpenseLedgerByDate(list, items) {
+    // Skipped payments are listed (greyed, like in Grouped) but left out of each month's count and total.
+    let month = '';
+    items.forEach((transaction) => {
+      const key = expenseLedgerDate(transaction).slice(0, 7);
+      if (key !== month) {
+        month = key;
+        const inMonth = items.filter((item) => expenseLedgerDate(item).slice(0, 7) === key && item.status !== 'skipped');
+        const heading = ledgerText(list, 'ts-ledger-group ts-ledger-group--month', /^\d{4}-\d{2}$/.test(key) ? expenseMonthLabel(key) : 'No date');
+        ledgerText(heading, 'ts-ledger-group__count', `${inMonth.length} · ${operationsMoney(inMonth.reduce((total, item) => total + (Number(item.amount) || 0), 0))}`);
+      }
+      renderExpenseTransactionRow(list, transaction);
+    });
   }
 
   // "Paid 3 Sep 2026 · Invoice 28 Aug 2026", "Invoice 1 Oct 2026" or "Due 15 Oct 2026".
@@ -329,21 +530,43 @@
     return parts.join(' · ');
   }
 
+  /** What a status badge explains on hover (the app's data-tip bubble). */
+  function expenseStatusTip(transaction, status) {
+    if (status.key === 'skipped') return transaction.paid_date ? 'Skipped (deleted after it was paid). Not counted. Restore brings it back as paid.' : 'Skipped. Not counted, and the schedule won’t list it again. Restore brings it back as a payment to make.';
+    if (status.key === 'scheduled') return (status.label === 'Due' ? 'Due' : 'Upcoming') + ' payment from a schedule. It doesn’t count as spent until you mark it paid.';
+    if (status.key === 'unpaid') return 'Unpaid. Counted on an accrual basis from its invoice date; not counted on a cash basis until you mark it paid.';
+    return ['Paid ' + expenseDateLabel(transaction.paid_date) + (transaction.payment_method ? ' by ' + transaction.payment_method : ''), transaction.payment_reference ? 'Ref ' + transaction.payment_reference : ''].filter(Boolean).join('\n');
+  }
+
+  const EXPENSE_LINK_SVG = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"/><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"/></svg>';
+
+  /**
+   * One ledger row, always two lines: the description (vendor only when there's no description) over the
+   * dates and the vendor, then category, status, amounts and actions in fixed columns. Explanations live
+   * in the badge's tooltip; receipt links sit behind the link button.
+   */
   function renderExpenseTransactionRow(list, transaction) {
     const status = expensePaymentStatus(transaction);
     const row = document.createElement('div');
     row.className = 'ts-ledger-row' + (status.key === 'skipped' ? ' is-skipped' : '');
     const identity = document.createElement('div');
-    ledgerText(identity, 'ts-ledger-row__title', transaction.vendor || transaction.description || 'Untitled expense');
-    const meta = ledgerText(identity, 'ts-ledger-row__meta', [expenseDatesLabel(transaction), transaction.description && transaction.vendor ? transaction.description : ''].filter(Boolean).join(' · '));
-    const tag = expenseCategoryTag(transaction);
-    if (tag) { meta.append(' '); meta.appendChild(tag); }
+    identity.className = 'ts-ledger-row__identity';
+    const name = transaction.description || transaction.vendor || 'Untitled expense';
+    ledgerText(identity, 'ts-ledger-row__title', name);
+    ledgerText(identity, 'ts-ledger-row__meta', [expenseDatesLabel(transaction), transaction.vendor && transaction.vendor !== name ? transaction.vendor : ''].filter(Boolean).join(' · '));
     row.appendChild(identity);
 
+    const categoryCell = document.createElement('div');
+    categoryCell.className = 'ts-ledger-row__category';
+    const tag = expenseCategoryTag(transaction);
+    if (tag) categoryCell.appendChild(tag);
+    row.appendChild(categoryCell);
+
     const stateCell = document.createElement('div');
+    stateCell.className = 'ts-ledger-row__state';
     const badge = document.createElement('span'); badge.className = 'ts-badge' + (status.tone ? ' ' + status.tone : ''); badge.textContent = status.label;
+    badge.dataset.tip = expenseStatusTip(transaction, status); badge.tabIndex = 0;
     stateCell.appendChild(badge);
-    if (status.key === 'paid' && (transaction.payment_method || transaction.payment_reference)) ledgerText(stateCell, 'ts-ledger-row__meta', [transaction.payment_method ? 'by ' + transaction.payment_method : '', transaction.payment_reference ? 'ref ' + transaction.payment_reference : ''].filter(Boolean).join(' · '));
     row.appendChild(stateCell);
     row.appendChild(expenseAmountCell(transaction));
 
@@ -352,33 +575,66 @@
     if (status.key === 'skipped') {
       // Restoring is the only action: deleting the row would let the schedule list the payment again.
       actions.appendChild(expenseConfirmButton('Restore', 'Confirm restore', () => expenseCall('api_restoreExpenseTransaction', { id:transaction.id }), 'Payment restored'));
-      row.appendChild(actions);
-      ledgerText(row, 'ts-ledger-row__detail', transaction.paid_date ? 'Skipped (deleted after it was paid). Not counted. Restore brings it back as paid.' : 'Skipped. Not counted, and the schedule won’t list it again. Restore brings it back as a payment to make.');
-      list.appendChild(row);
-      return;
-    }
-    if (status.key !== 'paid') actions.appendChild(expenseActionButton('Mark paid', () => showExpenseInlineAction(row, transaction, 'markpaid'), true));
-    actions.appendChild(expenseActionButton('Edit', () => openExpenseForm(transaction)));
-    if (transaction.status === 'scheduled') {
-      actions.appendChild(expenseConfirmButton('Skip', 'Confirm skip', () => operationsApi('api_skipExpenseOccurrence', { id:transaction.id }), 'Payment skipped'));
     } else {
-      actions.append(
-        expenseActionButton(transaction.attachments && transaction.attachments.length ? 'Add another receipt' : 'Add receipt', () => showExpenseInlineAction(row, transaction, 'receipt')),
-        expenseConfirmButton('Delete', 'Confirm delete', () => expenseCall('api_deleteExpenseTransaction', { id:transaction.id }), 'Expense deleted')
-      );
+      if (status.key !== 'paid') actions.appendChild(expenseActionButton('Mark paid', () => showExpenseInlineAction(row, transaction, 'markpaid'), true));
+      actions.appendChild(expenseActionButton('Edit', () => openExpenseForm(transaction)));
+      if (transaction.status === 'scheduled') actions.appendChild(expenseConfirmButton('Skip', 'Confirm skip', () => operationsApi('api_skipExpenseOccurrence', { id:transaction.id }), 'Payment skipped'));
+      else {
+        actions.appendChild(expenseConfirmButton('Delete', 'Confirm delete', () => expenseCall('api_deleteExpenseTransaction', { id:transaction.id }), 'Expense deleted'));
+        // Receipt links: one small button that shows how many there are and opens the list to open, add or remove.
+        const count = (transaction.attachments || []).length;
+        const links = document.createElement('button');
+        links.type = 'button'; links.className = 'ghost small ts-expense-link-button' + (count ? ' has-links' : '');
+        links.innerHTML = EXPENSE_LINK_SVG;
+        if (count) links.appendChild(document.createTextNode(String(count)));
+        links.setAttribute('aria-label', count ? `Receipt links (${count})` : 'Add a receipt link');
+        links.dataset.tip = count ? `${count} receipt link${count === 1 ? '' : 's'}` : 'Add a receipt link';
+        links.addEventListener('click', () => showExpenseInlineAction(row, transaction, 'receipt'));
+        actions.appendChild(links);
+      }
     }
     row.appendChild(actions);
-
-    if (transaction.status === 'scheduled') ledgerText(row, 'ts-ledger-row__detail', 'Upcoming payment from a schedule. It doesn’t count as spent until you mark it paid.');
-    else if (status.key === 'unpaid') ledgerText(row, 'ts-ledger-row__detail', 'Unpaid. Counted on an accrual basis from its invoice date; not counted on a cash basis until you mark it paid.');
-    (transaction.attachments || []).forEach((attachment) => {
-      const line = document.createElement('div'); line.className = 'ts-ledger-row__detail ts-expense-subline';
-      const link = document.createElement('a'); link.href = attachment.url; link.target = '_blank'; link.rel = 'noopener'; link.textContent = 'Receipt: ' + (attachment.name || 'link');
-      line.appendChild(link);
-      line.appendChild(expenseConfirmButton('Remove receipt', 'Confirm remove', () => operationsApi('api_detachExpenseReceipt', { expense_transaction_id:transaction.id, attachment_id:attachment.id }), 'Receipt removed'));
-      row.appendChild(line);
-    });
     list.appendChild(row);
+  }
+
+  /** The receipt links already on an expense, each to open or remove, above the field to add another. */
+  function renderExpenseReceiptLinks(panel, transaction) {
+    const attachments = transaction.attachments || [];
+    if (!attachments.length) return;
+    const listEl = document.createElement('ul'); listEl.className = 'ts-ledger-inline__links';
+    attachments.forEach((attachment) => {
+      const item = document.createElement('li');
+      const link = document.createElement('a'); link.href = attachment.url; link.target = '_blank'; link.rel = 'noopener';
+      let host = '';
+      try { host = new URL(attachment.url).hostname.replace(/^www\./, ''); } catch (error) { host = ''; }
+      link.textContent = (attachment.name || 'Receipt') + (host ? ' · ' + host : '');
+      const remove = expenseConfirmButton('Remove receipt', 'Confirm remove', () => operationsApi('api_detachExpenseReceipt', { expense_transaction_id:transaction.id, attachment_id:attachment.id }), 'Receipt removed');
+      remove.className = 'ts-expense-text-button ts-expense-text-button--quiet';
+      item.append(link, remove);
+      listEl.appendChild(item);
+    });
+    panel.appendChild(listEl);
+  }
+
+  // The month the Company expenses popup is showing, so a newer ledger load can refresh it in place.
+  let companyExpensesModalMonth = null;
+
+  /** A month's breakdown from the loaded ledger, or null when the ledger has no breakdowns (older cache). */
+  function companyLedgerBreakdownForMonth(year, month) {
+    const ledger = typeof state !== 'undefined' ? state.companyExpenseLedger : null;
+    const basis = typeof defaultAccountingBasis === 'function' ? defaultAccountingBasis() : 'cash';
+    const months = ledger && ledger.breakdowns ? ledger.breakdowns[basis] : null;
+    if (!months) return null;
+    const empty = { expenses:[], totals:{ amount:0, amount_ex_gst:0, gst_credit:0, counted:0 }, pending:[], pending_totals:{ amount:0, amount_ex_gst:0 } };
+    return { ...(months[`${year}-${String(month + 1).padStart(2, '0')}`] || empty), accounting_basis:basis };
+  }
+
+  function refreshOpenCompanyExpensesModal() {
+    const modal = document.getElementById('modal-monthly-deductions');
+    if (!companyExpensesModalMonth || !modal || modal.style.display === 'none' || !/^Company expenses/.test(document.getElementById('monthly-deductions-title')?.textContent || '')) return;
+    const { year, month } = companyExpensesModalMonth;
+    const result = companyLedgerBreakdownForMonth(year, month);
+    if (result) renderCompanyExpensesModal(document.getElementById('monthly-deductions-content'), modal, result, new Date(year, month, 1).toLocaleDateString('en-AU', { month:'long', year:'numeric' }));
   }
 
   /**
@@ -395,6 +651,14 @@
     const basis = defaultAccountingBasis();
     title.textContent = `Company expenses · ${monthLabel}`;
     content.replaceChildren();
+    companyExpensesModalMonth = { year, month };
+    // The monthly totals load brings every month's breakdown, so this usually opens with no server call.
+    const cached = companyLedgerBreakdownForMonth(year, month);
+    if (cached) {
+      renderCompanyExpensesModal(content, modal, cached, monthLabel);
+      if (typeof showModal === 'function') showModal(modal); else modal.style.display = 'flex';
+      return;
+    }
     ledgerText(content, 'ts-note', 'Loading company expenses…');
     if (typeof showModal === 'function') showModal(modal); else modal.style.display = 'flex';
     let result;
@@ -410,53 +674,98 @@
 
   function renderCompanyExpensesModal(content, modal, result, monthLabel) {
     content.replaceChildren();
-    const openExpenses = (item) => {
+    // View in Expenses and Edit both land on the ledger filtered to this month.
+    const shownMonth = companyExpensesModalMonth;
+    const openExpenses = async (item) => {
       if (typeof hideModal === 'function') hideModal(modal); else modal.style.display = 'none';
-      Promise.resolve(typeof showPage === 'function' ? showPage('expenses') : null).then(() => { if (item) openExpenseForm(item); });
+      // Edit opens the expense form right here and comes back to this popup; View in Expenses opens the
+      // ledger on this month.
+      if (item) {
+        await ensureExpenseFormLists();
+        operationsState.expenseFormReturn = shownMonth;
+        openExpenseForm(item);
+        return;
+      }
+      if (shownMonth) showExpenseLedgerMonth(shownMonth.year, shownMonth.month);
+      if (typeof showPage === 'function') showPage('expenses');
     };
-    const dateWord = result.accounting_basis === 'cash' ? 'paid date' : 'invoice or paid date, whichever is earlier';
-    if (!result.expenses.length) {
-      ledgerText(content, 'ts-note', `No company expenses count in ${monthLabel} on a ${result.accounting_basis} basis (by ${dateWord}).`);
+    const pending = result.pending || [];
+    const basisNote = result.accounting_basis === 'cash'
+      ? 'Cash basis: an expense counts on the day it’s paid.'
+      : 'Accrual basis: an expense counts on its invoice date, or the day it’s paid if that’s earlier.';
+    if (!result.expenses.length && !pending.length) {
+      ledgerText(content, 'ts-note', `No company expenses in ${monthLabel}. ${basisNote}`);
       const open = expenseActionButton('Open Expenses', () => openExpenses(null));
+      open.classList.add('ts-company-expenses-open');
       content.appendChild(open);
       return;
     }
     const partial = result.expenses.some((item) => expenseRound(item.counted) !== expenseRound(item.amount_ex_gst));
     const table = document.createElement('table'); table.className = 'ts-ded-modal-table ts-company-expenses-table';
+    // Fixed column widths so every row is one line and the amounts line up; long descriptions end in "…".
+    const widths = ['64px', '', '100px', '100px'].concat(partial ? ['100px'] : []).concat(['52px']);
+    const columns = document.createElement('colgroup');
+    widths.forEach((width) => { const col = document.createElement('col'); if (width) col.style.width = width; columns.appendChild(col); });
+    table.appendChild(columns);
     const headRow = table.createTHead().insertRow();
     const heads = ['Date', 'Expense', 'Inc GST', 'Ex GST'].concat(partial ? ['Counts'] : []).concat(['']);
     heads.forEach((text, index) => { const th = document.createElement('th'); th.textContent = text; if (index >= 2 && text) th.className = 'num'; headRow.appendChild(th); });
     const body = table.createTBody();
     const cell = (row, text, className) => { const td = row.insertCell(); td.textContent = text; if (className) td.className = className; return td; };
-    result.expenses.forEach((item) => {
-      const row = body.insertRow(); row.className = 'ts-ded-trow';
-      cell(row, expenseDateLabel(item.counted_date), 'ts-ded-tdate');
+    // The month is in the title, so dates drop the year.
+    const shortDate = (iso) => expenseDateLabel(iso).replace(/ \d{4}$/, '');
+    const expenseRow = (item, date, status) => {
+      const row = body.insertRow(); row.className = 'ts-ded-trow' + (status ? ' is-pending' : '');
+      cell(row, shortDate(date), 'ts-ded-tdate');
+      // One line: a category dot and the description (the vendor if there's no description); hover for the rest.
       const name = cell(row, '', 'ts-ded-tname');
-      ledgerText(name, '', item.vendor || item.description || 'Expense');
-      const tag = expenseCategoryTag(item);
-      const detail = item.description && item.vendor ? item.description : '';
-      if (tag || detail) {
-        const meta = ledgerText(name, 'ts-ledger-row__meta', detail);
-        if (tag) { if (detail) meta.append(' '); meta.appendChild(tag); }
-      }
+      const dot = document.createElement('span'); dot.className = 'ts-company-expenses-dot';
+      if (item.category) dot.style.background = typeof dataColor === 'function' ? dataColor(item.category_color || '#6b7280') : (item.category_color || '#6b7280');
+      else dot.classList.add('is-empty');
+      const label = document.createElement('span'); label.className = 'ts-company-expenses-name'; label.textContent = item.description || item.vendor || 'Expense';
+      const line = document.createElement('div'); line.className = 'ts-company-expenses-line';
+      line.append(dot, label);
+      if (status) { const badge = document.createElement('span'); badge.className = 'ts-badge' + (status.tone ? ' ' + status.tone : ''); badge.textContent = status.label; line.appendChild(badge); }
+      name.appendChild(line);
+      // The app's own tooltip (as on the Time Entry ⓘ), one detail per line; the description may be cut short.
+      name.setAttribute('data-tip', [item.description, item.vendor ? 'Vendor: ' + item.vendor : '', 'Category: ' + (item.category || 'Uncategorised')].filter(Boolean).join('\n'));
       cell(row, operationsMoney(item.amount), 'num');
       cell(row, operationsMoney(item.amount_ex_gst), 'num');
       if (partial) {
-        const counts = cell(row, operationsMoney(item.counted), 'num');
-        if (expenseRound(item.counted) !== expenseRound(item.amount_ex_gst)) counts.title = `${Math.round(Number(item.business_use_percentage) * 100)}% business use, so only that share of the GST is claimed`;
+        const counts = cell(row, status ? '' : operationsMoney(item.counted), 'num');
+        if (!status && expenseRound(item.counted) !== expenseRound(item.amount_ex_gst)) counts.dataset.tip = `${Math.round(Number(item.business_use_percentage) * 100)}% business use, so only that share of the GST is claimed`;
       }
       const actions = row.insertCell(); actions.className = 'num';
-      actions.appendChild(expenseActionButton('Edit', () => openExpenses(item)));
-    });
-    const total = body.insertRow(); total.className = 'ts-ded-trow-total';
-    cell(total, 'Total').colSpan = 2;
-    cell(total, operationsMoney(result.totals.amount), 'num');
-    cell(total, operationsMoney(result.totals.amount_ex_gst), 'num');
-    if (partial) cell(total, operationsMoney(result.totals.counted), 'num');
-    total.insertCell();
+      const edit = document.createElement('button'); edit.type = 'button'; edit.className = 'ts-expense-text-button'; edit.textContent = 'Edit';
+      edit.addEventListener('click', () => openExpenses(item));
+      actions.appendChild(edit);
+    };
+    const totalRow = (label, amounts, className) => {
+      const row = body.insertRow(); row.className = className;
+      cell(row, label).colSpan = 2;
+      cell(row, operationsMoney(amounts.amount), 'num');
+      cell(row, operationsMoney(amounts.amount_ex_gst), 'num');
+      if (partial) cell(row, amounts.counted === undefined ? '' : operationsMoney(amounts.counted), 'num');
+      row.insertCell();
+    };
+    result.expenses.forEach((item) => expenseRow(item, item.counted_date, null));
+    totalRow('Total', result.totals, 'ts-ded-trow-total');
+    // Unpaid bills and schedule payments for the month, shown apart and left out of the total.
+    if (pending.length) {
+      const group = body.insertRow(); group.className = 'ts-company-expenses-group';
+      cell(group, 'Not counted yet').colSpan = widths.length;
+      pending.forEach((item) => expenseRow(item, item.supplier_invoice_date, expensePaymentStatus(item)));
+      totalRow('Not in the total', result.pending_totals, 'ts-company-expenses-subtotal');
+    }
     content.appendChild(table);
-    ledgerText(content, 'ts-note ts-company-expenses-note', `On a ${result.accounting_basis} basis an expense counts on its ${dateWord}. The Company expenses line takes off ${operationsMoney(result.totals.counted)}: ${operationsMoney(result.totals.amount)} including GST, less ${operationsMoney(result.totals.gst_credit)} of GST credits.`);
+    const foot = document.createElement('div'); foot.className = 'ts-company-expenses-foot';
+    ledgerText(foot, 'ts-note', basisNote);
+    const view = document.createElement('button'); view.type = 'button'; view.className = 'ts-expense-text-button'; view.textContent = 'View in Expenses';
+    view.addEventListener('click', () => openExpenses(null));
+    foot.appendChild(view);
+    content.appendChild(foot);
   }
+
 
   function expenseInlineField(panel, labelText, input, grow) {
     const wrap = document.createElement('div');
@@ -486,18 +795,19 @@
     row.parentElement.querySelectorAll('.ts-ledger-inline').forEach((el) => el.remove());
     const panel = document.createElement('form');
     panel.className = 'ts-ledger-inline';
-    ledgerText(panel, 'ts-ledger-inline__title', mode === 'markpaid' ? `Mark paid · ${operationsMoney(transaction.amount)}` : 'Add receipt');
+    ledgerText(panel, 'ts-ledger-inline__title', mode === 'markpaid' ? `Mark paid · ${operationsMoney(transaction.amount)}` : 'Receipt links');
     let date, method, reference, url;
     if (mode === 'markpaid') {
       date = expenseInlineField(panel, 'Paid date', expenseInput('date', { required:true, value:expenseDefaultPaidDate(transaction) }));
       method = expenseInlineField(panel, 'Paid by', fillPaymentMethodSelect(document.createElement('select'), expenseDefaultPaymentMethod(transaction.vendor)));
       reference = expenseInlineField(panel, 'Reference (optional)', expenseInput('text', { maxLength:160, placeholder:'Bank or card ref' }), true);
     } else {
-      url = expenseInlineField(panel, 'Link to the receipt or tax invoice', expenseInput('url', { required:true, placeholder:'https://drive.google.com/…' }), true);
+      renderExpenseReceiptLinks(panel, transaction);
+      url = expenseInlineField(panel, (transaction.attachments || []).length ? 'Add another link' : 'Link to the receipt or tax invoice', expenseInput('url', { required:true, placeholder:'https://drive.google.com/…' }), true);
     }
     const buttons = document.createElement('div'); buttons.className = 'ts-ledger-inline__buttons';
-    const submit = document.createElement('button'); submit.type = 'submit'; submit.textContent = mode === 'markpaid' ? 'Mark paid' : 'Save receipt';
-    const cancel = document.createElement('button'); cancel.type = 'button'; cancel.className = 'ghost'; cancel.textContent = 'Cancel'; cancel.addEventListener('click', () => panel.remove());
+    const submit = document.createElement('button'); submit.type = 'submit'; submit.textContent = mode === 'markpaid' ? 'Mark paid' : 'Add link';
+    const cancel = document.createElement('button'); cancel.type = 'button'; cancel.className = 'ghost'; cancel.textContent = mode === 'markpaid' ? 'Cancel' : 'Close'; cancel.addEventListener('click', () => panel.remove());
     buttons.append(submit, cancel);
     panel.appendChild(buttons);
     panel.addEventListener('submit', async (event) => {
@@ -582,10 +892,11 @@
     const ex = item.amount_ex_gst !== '' && item.amount_ex_gst != null ? item.amount_ex_gst : expenseExFromInc(item.amount, item.gst_code);
     ledgerText(cell, 'ts-ledger-row__meta', operationsMoney(ex) + ' ex GST');
     const businessUse = item.business_use_percentage === '' || item.business_use_percentage == null ? 1 : Number(item.business_use_percentage);
+    // Part business use: what it counts as goes in the tooltip, so every row stays two lines.
     if (item.gst_code === 'taxable' && businessUse < 1) {
       const counted = expenseRound(Number(item.amount) - expenseRound((Number(item.amount) - Number(ex)) * businessUse));
-      const note = ledgerText(cell, 'ts-ledger-row__meta', 'counts ' + operationsMoney(counted));
-      note.title = `${Math.round(businessUse * 100)}% business use, so only that share of the GST is claimed`;
+      cell.classList.add('has-tip');
+      cell.dataset.tip = `Counts ${operationsMoney(counted)}: ${Math.round(businessUse * 100)}% business use, so only that share of the GST is claimed`;
     }
     return cell;
   }
@@ -782,14 +1093,13 @@
     operationsState.expenseEditId = item && item.id ? item.id : '';
     operationsState.expenseEditStatus = item ? item.status : '';
     if (expenseRuleFormOpen()) closeExpenseRuleForm();
-    const form = document.getElementById('expense-form'); form.style.display = 'block'; form.reset();
-    document.getElementById('expense-vendor').value = item?.vendor || ''; document.getElementById('expense-abn').value = item?.vendor_abn || ''; document.getElementById('expense-description').value = item?.description || ''; renderExpenseCategoryOptions(document.getElementById('expense-category'), item?.category_id || ''); showNewExpenseCategory('expense-category', false); document.getElementById('expense-gst-code').value = item?.gst_code || 'taxable'; setExpenseAmountPair('expense-amount', 'expense-amount-ex', item); document.getElementById('expense-notes').value = item?.notes || '';
+    const form = document.getElementById('expense-form'); form.reset();
+    document.getElementById('expense-vendor').value = item?.vendor || ''; document.getElementById('expense-abn').value = item?.vendor_abn || ''; document.getElementById('expense-description').value = item?.description || item?.vendor || ''; renderExpenseCategoryOptions(document.getElementById('expense-category'), item?.category_id || ''); showNewExpenseCategory('expense-category', false); document.getElementById('expense-gst-code').value = item?.gst_code || 'taxable'; setExpenseAmountPair('expense-amount', 'expense-amount-ex', item); document.getElementById('expense-notes').value = item?.notes || '';
     document.getElementById('expense-business-use').value = item ? Math.round((Number(item.business_use_percentage) || 0) * 10000) / 100 : 100;
     document.getElementById('expense-supplier-date').value = item?.supplier_invoice_date || '';
     // A schedule payment's date is when it falls due; it is paid by turning Paid on (or Mark paid).
+    // syncExpensePaidNow sets the date's label and hint to match.
     const scheduled = item && item.status === 'scheduled';
-    document.getElementById('expense-supplier-date-label').textContent = scheduled ? 'Due date' : 'Invoice date (optional)';
-    document.getElementById('expense-supplier-date-hint').style.display = scheduled ? 'none' : '';
     // A new expense is paid today by default; an existing one opens as it is.
     document.getElementById('expense-paid-now').checked = item ? !!item.paid_date : true;
     document.getElementById('expense-paid-date').value = item?.paid_date || (scheduled ? expenseDefaultPaidDate(item) : expenseToday());
@@ -797,16 +1107,50 @@
     const methodSelect = fillPaymentMethodSelect(document.getElementById('expense-paid-method'), item?.payment_method || expenseDefaultPaymentMethod(item?.vendor));
     if (item?.payment_method) methodSelect.dataset.touched = '1'; else delete methodSelect.dataset.touched;
     syncExpensePaidNow();
-    form.querySelector('h4').textContent = scheduled ? 'Edit this payment' : item ? 'Edit expense' : 'Record expense';
-    document.getElementById('expense-vendor').focus();
+    document.getElementById('expense-form-title').textContent = scheduled ? 'Edit scheduled expense' : item ? 'Edit expense' : 'Record expense';
+    // An expense from a schedule says so, with a way to change the schedule itself.
+    const fromSchedule = !!(item && item.source_rule_id);
+    document.getElementById('expense-form-schedule').hidden = !fromSchedule;
+    operationsState.expenseEditRuleId = fromSchedule ? item.source_rule_id : '';
+    showExpenseFormModal();
+    // Description is the expense's name in the ledger, so it's asked first.
+    document.getElementById('expense-description').focus();
   }
 
   function syncExpensePaidNow() {
     const on = document.getElementById('expense-paid-now').checked;
-    document.getElementById('expense-paid-now-fields').style.display = on ? '' : 'none';
+    document.querySelectorAll('[data-expense-paid-field]').forEach((field) => { field.style.display = on ? '' : 'none'; });
     document.getElementById('expense-paid-date').required = on;
     // Unpaid (or upcoming), the invoice or due date is what dates the expense, so it's needed.
     document.getElementById('expense-supplier-date').required = !on;
+    const scheduled = operationsState.expenseEditStatus === 'scheduled';
+    document.getElementById('expense-paid-now-hint').textContent = on ? 'Turn off for a bill you haven’t paid yet.' : scheduled ? 'Turn on once it’s paid.' : 'Turn on when you’ve paid it.';
+    document.getElementById('expense-supplier-date-label').textContent = scheduled ? 'Due date' : on ? 'Invoice date (optional)' : 'Invoice date';
+    document.getElementById('expense-supplier-date-hint').textContent = on ? 'Leave blank if it’s the day you paid.' : 'Needed for a bill you haven’t paid yet.';
+    document.getElementById('expense-supplier-date-hint').style.display = scheduled ? 'none' : '';
+  }
+
+  function showExpenseFormModal() {
+    const modal = document.getElementById('modal-expense-form');
+    if (typeof showModal === 'function') showModal(modal); else modal.style.display = 'flex';
+  }
+
+  function hideExpenseFormModal() {
+    const modal = document.getElementById('modal-expense-form');
+    if (!modal) return;
+    if (typeof hideModal === 'function') hideModal(modal); else modal.style.display = 'none';
+    // Opened from the Time Entry "Company expenses" popup: go back to it. It refreshes itself when the
+    // reload after a save arrives.
+    const back = operationsState.expenseFormReturn;
+    operationsState.expenseFormReturn = null;
+    if (back) showCompanyExpensesModal(back.year, back.month);
+  }
+
+  /** The categories the expense form needs, when it opens before the Expenses page has loaded them. */
+  async function ensureExpenseFormLists() {
+    if (operationsState.categories.length) return;
+    try { setExpenseCategories(await operationsApi('api_getDeductionCategories')); }
+    catch (error) { operationsStatus('Could not load categories: ' + (error && error.message ? error.message : error), 'warn'); }
   }
 
   function hideExpenseRuleConfirm() {
@@ -902,7 +1246,7 @@
 
   function openExpenseRuleForm(rule) {
     operationsState.expenseRuleEditId = rule && rule.id ? rule.id : '';
-    document.getElementById('expense-form').style.display = 'none';
+    hideExpenseFormModal();
     const placeholder = document.getElementById('expense-rule-detail-placeholder');
     if (placeholder) placeholder.style.display = 'none';
     const form = document.getElementById('expense-rule-form'); form.style.display = 'block'; form.reset();
@@ -917,7 +1261,7 @@
     set('expense-rule-start', rule?.start_date || expenseToday()); set('expense-rule-end', rule?.end_date || '');
     renderExpenseCategoryOptions(document.getElementById('expense-rule-category'), rule?.category_id || ''); showNewExpenseCategory('expense-rule-category', false); set('expense-rule-gst-code', rule?.gst_code || 'taxable'); setExpenseAmountPair('expense-rule-amount', 'expense-rule-amount-ex', rule);
     set('expense-rule-business-use', rule ? Math.round((Number(rule.business_use_percentage) || 0) * 10000) / 100 : 100);
-    set('expense-rule-description', rule?.description || ''); set('expense-rule-notes', rule?.notes || '');
+    set('expense-rule-description', rule?.description || rule?.vendor || ''); set('expense-rule-notes', rule?.notes || '');
     document.getElementById('expense-rule-form-title').textContent = rule ? 'Edit schedule' : 'New schedule';
     renderExpenseRulePreview();
     operationsState.ruleFormSnapshot = expenseRuleFormValues();
@@ -957,7 +1301,20 @@
   document.getElementById('expense-rule-amount')?.addEventListener('expense-amount-sync', renderExpenseRulePreview);
   document.getElementById('expense-add')?.addEventListener('click', () => openExpenseForm());
   document.getElementById('expense-rule-add')?.addEventListener('click', () => openExpenseRuleForm());
-  document.getElementById('expense-form-cancel')?.addEventListener('click', () => { document.getElementById('expense-form').style.display = 'none'; });
+  document.getElementById('expense-form-cancel')?.addEventListener('click', hideExpenseFormModal);
+  // "Edit the schedule" from an expense a schedule created: closes the popup and opens the schedule.
+  document.getElementById('expense-form-open-schedule')?.addEventListener('click', async () => {
+    const ruleId = operationsState.expenseEditRuleId;
+    operationsState.expenseFormReturn = null;
+    hideExpenseFormModal();
+    const tab = document.querySelector('[data-expense-tab="rules"]');
+    if (tab && operationsState.expenseTab !== 'rules') tab.click();
+    // From Time Entry the Expenses page may not have loaded its schedules yet.
+    if (typeof state === 'undefined' || state.currentPage !== 'expenses') await (typeof showPage === 'function' ? showPage('expenses') : null);
+    if (!operationsState.rules.some((item) => item.id === ruleId) && operationsState.pageLoad) await operationsState.pageLoad;
+    const rule = operationsState.rules.find((item) => item.id === ruleId);
+    if (rule) selectExpenseRule(rule);
+  });
   document.getElementById('expense-rule-form-cancel')?.addEventListener('click', closeExpenseRuleForm);
   document.getElementById('expense-rule-expand-all')?.addEventListener('click', () => setAllExpenseRuleGroups(false));
   document.getElementById('expense-rule-collapse-all')?.addEventListener('click', () => setAllExpenseRuleGroups(true));
@@ -992,7 +1349,7 @@
     try {
       const result = await expenseCall('api_upsertExpenseTransaction', payload);
       if (result.success === false) { if (!result.cancelled) operationsStatus(result.message, 'warn'); return; }
-      form.style.display = 'none'; operationsState.expenseEditId = '';
+      hideExpenseFormModal(); operationsState.expenseEditId = '';
       operationsStatus(editing ? 'Expense saved' : (paid ? 'Expense recorded as paid' : 'Expense recorded as unpaid'));
       renderExpensesPage();
     } catch (error) {
@@ -1013,7 +1370,13 @@
     const value = (id) => document.getElementById(id).value;
     saveExpenseRule({ id:operationsState.expenseRuleEditId || '', vendor:value('expense-rule-vendor'), vendor_abn:value('expense-rule-abn'), description:value('expense-rule-description'), category_id:expenseCategoryValue('expense-rule-category'), ...readExpenseAmountPair('expense-rule-amount', 'expense-rule-amount-ex', value('expense-rule-gst-code')), gst_code:value('expense-rule-gst-code'), business_use_percentage:Number(value('expense-rule-business-use')), frequency:value('expense-rule-frequency'), start_date:value('expense-rule-start'), end_date:value('expense-rule-end'), notes:value('expense-rule-notes') });
   });
-  document.getElementById('expense-filter-apply')?.addEventListener('click',renderExpensesPage);
+  document.getElementById('expense-filter-month')?.addEventListener('change', (event) => setExpenseLedgerFilter({ month:event.target.value }));
+  document.getElementById('expense-filter-state')?.addEventListener('change', (event) => setExpenseLedgerFilter({ status:event.target.value }));
+  document.getElementById('expense-filter-category')?.addEventListener('change', (event) => setExpenseLedgerFilter({ category:event.target.value }));
+  document.getElementById('expense-filter-prev')?.addEventListener('click', () => stepExpenseLedgerMonth(-1));
+  document.getElementById('expense-filter-next')?.addEventListener('click', () => stepExpenseLedgerMonth(1));
+  document.getElementById('expense-filter-clear')?.addEventListener('click', () => setExpenseLedgerFilter({ month:'', status:'', category:'' }));
+  document.querySelectorAll('[data-expense-view]').forEach((button) => button.addEventListener('click', () => { expenseLedgerPrefs().view = button.dataset.expenseView; saveExpenseLedgerPrefs(); renderExpenseTransactions(); }));
   document.querySelectorAll('[data-expense-tab]').forEach((button)=>button.addEventListener('click',()=>{ operationsState.expenseTab=button.dataset.expenseTab; document.querySelectorAll('[data-expense-tab]').forEach((item)=>{ const active=item===button; item.classList.toggle('is-active',active); item.setAttribute('aria-selected',String(active)); }); ['transactions','rules','report'].forEach((name)=>{ document.getElementById(`expense-${name}-panel`).style.display=name===operationsState.expenseTab?'block':'none'; }); }));
   document.getElementById('expense-report-fy')?.addEventListener('change',renderExpenseReport);
   document.getElementById('expense-export')?.addEventListener('click',async()=>{ const fy=Number(document.getElementById('expense-report-fy').value); const result=await operationsApi('api_exportExpenseReportCsv',{financial_year:fy,accounting_basis:defaultAccountingBasis()}); const link=document.createElement('a'); link.href=URL.createObjectURL(new Blob([result.csv],{type:'text/csv;charset=utf-8'})); link.download=result.filename; link.click(); URL.revokeObjectURL(link.href); });

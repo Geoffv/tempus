@@ -32,19 +32,19 @@ Use a schedule for anything you pay on a regular cycle, such as insurance, rent 
 5. Leave **End date (optional)** blank to keep the schedule going, or set the date of the last payment. An end date before the start date means the schedule never lists a payment.
 6. Check the category, GST treatment and business-use percentage, then choose **Save schedule**.
 
-Before you save, the form shows the next five payment dates. When you save, Tempus lists the schedule's payments under **Transactions → Due and upcoming**, as far ahead as **Expense creation** allows (see below). Dates before today are not added. Record a past purchase as a one-off expense instead.
+Before you save, the form shows the next five payment dates. When you save, Tempus lists the schedule's payments under **Transactions → Due and upcoming**, as far ahead as **List scheduled expenses** allows (see below). Dates before today are not added. Record a past purchase as a one-off expense instead.
 
 Each schedule card shows the amount including and excluding GST, how often it repeats, its start and end dates and when the next payment is due. It also shows **Ended** once the end date has passed (ended schedules sort last in their category), a GST treatment other than Taxable, or a business use under 100%, when those apply. Click a card to open it.
 
 With more than five schedules a search box appears. With three or more categories, or more than six schedules, the categories collapse, one open at a time, with **Expand all** and **Collapse all**.
 
-### Expense creation
+### List scheduled expenses
 
-**Expense creation** in Settings (company features, with the expense ledger on) decides how far ahead each schedule's payments are listed:
+**List scheduled expenses** in Settings (company features, with the expense ledger on) decides how far ahead each schedule's expenses are listed:
 
-- **On scheduled date**: each payment appears on its due date.
-- **For current month** (the default): all of this month's payments, from the 1st. Next month's appear on the 1st of next month.
-- **For financial year**: everything to 30 June. Next year's appear from 1 July.
+- **On the day they're due**: each one appears on its due date.
+- **For the current month** (the default): all of this month's, from the 1st. Next month's appear on the 1st of next month.
+- **For the whole financial year**: everything to 30 June. Next year's appear from 1 July.
 
 Payments are created whenever Tempus or the Expenses page opens, including any that fell due while Tempus wasn't opened; those show as **Due**. Switching to a shorter option removes upcoming payments past the new window, and switching to a longer one adds them. Payments you have edited are kept.
 

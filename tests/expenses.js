@@ -93,7 +93,7 @@ exports.run = test => {
     assert.deepStrictEqual(scheduled(dueToday, dueToday.api_upsertExpenseRule(rulePayload()).rule.id), ['2026-10-15'], 'on its due date');
     assert.equal(month.expenseCreationWindowEnd_('month', '2026-02-10'), '2026-02-28');
     assert.equal(month.expenseCreationWindowEnd_('financial_year', '2027-03-01'), '2027-06-30');
-    assert.throws(() => month.api_updateSettings({ expense_creation: 'yearly' }), /Expense creation must be/);
+    assert.throws(() => month.api_updateSettings({ expense_creation: 'yearly' }), /List scheduled expenses must be/);
     month.getOrCreateSheet('user_settings').appendRow(['expense_creation', '', 'string']);
   });
 
@@ -221,7 +221,8 @@ exports.run = test => {
 
   test('the ledger lists skipped payments in a folded Skipped group with Restore', () => {
     assert.match(operationsScripts, /if \(transaction\.status === 'skipped'\) return \{ key:'skipped', label:'Skipped'/);
-    assert.match(operationsScripts, /ledgerText\(list, 'ts-ledger-group', 'Skipped'\);[\s\S]*?if \(operationsState\.showSkipped\) skipped\.forEach/);
+    assert.match(operationsScripts, /if \(skipped\.length && expenseLedgerGroupHead\(list, 'skipped', 'Skipped', skipped\)\) skipped\.forEach/);
+    assert.match(operationsScripts, /folded:Object\.assign\(\{ upcoming:false, recorded:false, skipped:true \}/, 'Skipped starts folded');
     assert.match(operationsScripts, /expenseConfirmButton\('Restore', 'Confirm restore', \(\) => expenseCall\('api_restoreExpenseTransaction'/);
   });
 
@@ -545,7 +546,8 @@ exports.run = test => {
     assert.equal(client.expenseDefaultPaidDate({ status: 'scheduled', supplier_invoice_date: '2026-10-15' }), TODAY, 'paying early defaults to today');
     const rows = extract(operationsScripts, 'renderExpenseTransactionRow');
     assert.ok(!/\.disabled\s*=/.test(rows), 'transaction rows never render disabled buttons');
-    ['Mark paid', 'Edit', 'Skip', 'Delete', 'Remove receipt'].forEach((text) => assert.ok(rows.includes("'" + text + "'"), text));
+    ['Mark paid', 'Edit', 'Skip', 'Delete', 'Restore'].forEach((text) => assert.ok(rows.includes("'" + text + "'"), text));
+    assert.ok(extract(operationsScripts, 'renderExpenseReceiptLinks').includes("'Remove receipt'"), 'receipts are removed from the link list');
     ['Reconcile', 'Void', 'Record payment', 'Remove payment', 'Record as unpaid bill'].forEach((text) => assert.ok(!operationsScripts.includes("'" + text + "'"), 'no ' + text));
     ['api_addExpensePayment', 'api_deleteExpensePayment', 'api_voidExpenseTransaction', 'api_reconcileExpenseTransaction'].forEach((name) => assert.ok(!operationsScripts.includes(name), name + ' is gone'));
     // Saving goes through the submitted-BAS confirmation.
@@ -788,6 +790,87 @@ exports.run = test => {
     assert.equal(client.companyLedgerExpensesForMonth(2026, 5).exGst, june.totals.counted, 'the modal total is the Time Entry line');
     const accrual = c.api_getCompanyExpensesForMonth({ year: 2026, month: 5, accounting_basis: 'accrual' });
     assert.ok(accrual.expenses.some((e) => e.vendor === 'Unpaid') && accrual.expenses.some((e) => e.vendor === 'Next month'), 'accrual: invoiced in June');
+    // Payments not counted yet are listed apart and left out of the totals.
+    assert.deepStrictEqual([june.pending.map((e) => e.vendor), june.pending_totals], [['Unpaid'], { amount: 33, amount_ex_gst: 30 }], 'cash: the unpaid bill waits');
+    assert.deepStrictEqual(JSON.parse(JSON.stringify(accrual.pending)), [], 'accrual: the unpaid bill already counts');
+  });
+
+  test('the monthly totals bring each month\'s breakdown, so the Time Entry popup opens from memory', () => {
+    const { context: c } = backend('2026-10-01', 'financial_year');
+    paidExpense(c, { vendor: 'Phone', description: 'Mobile plan', amount: 110, paid_date: '2026-10-10', business_use_percentage: 60, notes: 'Work phone' });
+    c.api_upsertExpenseTransaction({ vendor: 'Unpaid', amount: 33, supplier_invoice_date: '2026-10-15' });
+    c.api_upsertExpenseRule(rulePayload({ start_date: '2026-12-20' }));
+    const ledger = JSON.parse(JSON.stringify(c.api_getCompanyExpenseMonthlyTotals()));
+    ['cash', 'accrual'].forEach((basis) => {
+      const direct = JSON.parse(JSON.stringify(c.api_getCompanyExpensesForMonth({ year: 2026, month: 9, accounting_basis: basis })));
+      const cached = ledger.breakdowns[basis]['2026-10'];
+      assert.deepStrictEqual([cached.totals, cached.pending_totals], [direct.totals, direct.pending_totals], basis + ': same figures as the popup\'s own call');
+      assert.deepStrictEqual(cached.expenses.map((e) => e.id), direct.expenses.map((e) => e.id), basis);
+      assert.deepStrictEqual(cached.pending.map((e) => e.id), direct.pending.map((e) => e.id), basis);
+    });
+    const phone = ledger.breakdowns.cash['2026-10'].expenses[0];
+    assert.deepStrictEqual([phone.description, phone.notes, phone.counted, phone.attachments_json], ['Mobile plan', 'Work phone', 104, undefined], 'keeps what the popup and the expense form use, not attachments');
+    assert.ok(ledger.breakdowns.accrual['2026-12'].pending.length, 'a month with only schedule payments still has a breakdown');
+    // The popup renders from the ledger with no server call.
+    const client = { state: { companyExpenseLedger: ledger }, defaultAccountingBasis: () => 'cash', String };
+    vm.runInNewContext(extract(operationsScripts, 'companyLedgerBreakdownForMonth'), client);
+    assert.equal(client.companyLedgerBreakdownForMonth(2026, 9).totals.counted, ledger.breakdowns.cash['2026-10'].totals.counted);
+    assert.deepStrictEqual(JSON.parse(JSON.stringify(client.companyLedgerBreakdownForMonth(2026, 1))).expenses, [], 'an empty month is empty, not a server call');
+    assert.match(operationsScripts, /async function showCompanyExpensesModal\(year, month\) \{[\s\S]*?const cached = companyLedgerBreakdownForMonth\(year, month\);\s*if \(cached\) \{[\s\S]*?return;\s*\}/);
+  });
+
+  test('the expense form is a popup that asks for the description first, and says when an expense is from a schedule', () => {
+    const markup = fs.readFileSync(path.join(root, 'views/partials/operations.html'), 'utf8');
+    assert.match(markup, /<div class="ts-modal" id="modal-expense-form"[^>]*>\s*<form id="expense-form" class="ts-modal-content ts-expense-form"/);
+    assert.match(markup, /<input id="expense-description" required[\s\S]*<input id="expense-vendor" required/, 'Description comes first and is required');
+    assert.match(markup, /<input id="expense-rule-description" required/, 'schedules need a description too');
+    assert.match(markup, /id="expense-form-schedule" hidden>From a schedule\. Changes apply to this expense only\./);
+    assert.match(markup, /<div class="ts-modal-footer"><button type="button" class="ghost" id="expense-form-cancel">Cancel<\/button><button type="submit">Save expense<\/button><\/div>/);
+    const open = extract(operationsScripts, 'openExpenseForm');
+    assert.match(open, /item\?\.description \|\| item\?\.vendor/, 'an expense without a description starts with its vendor');
+    assert.match(open, /showExpenseFormModal\(\)/);
+    assert.ok(!/getElementById\('expense-form'\)\.style\.display/.test(operationsScripts), 'the form is shown and hidden as a popup');
+    // Outside the Expenses page, so Edit in the Time Entry popup opens it there and comes back to the popup.
+    assert.ok(markup.indexOf('id="modal-expense-form"') > markup.indexOf('</section>'), 'the popup is not inside the Expenses page');
+    const companyModal = extract(operationsScripts, 'renderCompanyExpensesModal');
+    assert.match(companyModal, /if \(item\) \{\s*await ensureExpenseFormLists\(\);\s*operationsState\.expenseFormReturn = shownMonth;\s*openExpenseForm\(item\);\s*return;\s*\}/);
+    assert.match(extract(operationsScripts, 'hideExpenseFormModal'), /if \(back\) showCompanyExpensesModal\(back\.year, back\.month\);/);
+  });
+
+  test('the ledger filters by month on the accounting basis, by status as the badges name them, and by category', () => {
+    let basis = 'cash';
+    const client = { defaultAccountingBasis: () => basis, expenseToday: () => '2026-10-25', operationsState: { ledgerFilter: null }, String, Number, Date };
+    vm.runInNewContext(['  const EXPENSE_UNCATEGORISED = \'__none__\';', ...['expensePaymentStatus', 'expenseLedgerFilter', 'expenseLedgerDate', 'expenseLedgerStatus', 'expenseFinancialYearMonths', 'expenseLedgerMatches'].map((name) => extract(operationsScripts, name))].join('\n'), client);
+    const paid = { status: 'recorded', paid_date: '2026-11-02', supplier_invoice_date: '2026-10-28', category_id: 'c1' };
+    const unpaid = { status: 'recorded', paid_date: '', supplier_invoice_date: '2026-10-05', category_id: '' };
+    const due = { status: 'scheduled', supplier_invoice_date: '2026-10-09', category_id: 'c1' };
+    const upcoming = { status: 'scheduled', supplier_invoice_date: '2026-12-09', category_id: 'c1' };
+    const skipped = { status: 'skipped', supplier_invoice_date: '2026-09-15', category_id: 'c1' };
+    const match = (item, filter) => client.expenseLedgerMatches(item, Object.assign({ month: '', status: '', category: '' }, filter));
+    assert.deepStrictEqual([match(paid, { month: '2026-11' }), match(paid, { month: '2026-10' })], [true, false], 'cash: the paid date');
+    basis = 'accrual';
+    assert.deepStrictEqual([match(paid, { month: '2026-11' }), match(paid, { month: '2026-10' })], [false, true], 'accrual: the earlier of invoice and paid date');
+    assert.ok(match(unpaid, { month: '2026-10' }) && match(due, { month: '2026-10' }), 'unpaid and schedule payments sit under their invoice or due date');
+    assert.deepStrictEqual([paid, unpaid, due, upcoming, skipped].map((item) => client.expenseLedgerStatus(item)), ['paid', 'unpaid', 'due', 'upcoming', 'skipped']);
+    assert.deepStrictEqual([paid, unpaid, due, upcoming, skipped].filter((item) => match(item, { status: 'due' })), [due]);
+    assert.deepStrictEqual([match(unpaid, { category: '__none__' }), match(paid, { category: '__none__' }), match(paid, { category: 'c1' })], [true, false, true]);
+    assert.deepStrictEqual([match(upcoming, { month: 'fy' }), match(skipped, { month: 'fy' }), match({ status: 'scheduled', supplier_invoice_date: '2027-07-01' }, { month: 'fy' })], [true, true, false], 'this financial year runs July to June');
+    const markup = fs.readFileSync(path.join(root, 'views/partials/operations.html'), 'utf8');
+    assert.doesNotMatch(markup, /expense-filter-from|expense-filter-to|expense-filter-apply/, 'no date range or Apply button');
+    assert.match(markup, /<select id="expense-filter-state"[^>]*><option value="">All statuses<\/option><option value="due">Due<\/option><option value="upcoming">Upcoming<\/option><option value="unpaid">Unpaid<\/option><option value="paid">Paid<\/option><option value="skipped">Skipped<\/option><\/select>/);
+    assert.match(markup, /data-expense-view="grouped"[\s\S]*data-expense-view="date"/);
+    const byDate = extract(operationsScripts, 'renderExpenseLedgerByDate');
+    assert.ok(/items\.forEach\(\(transaction\) =>/.test(byDate) && /item\.status !== 'skipped'\);/.test(byDate), 'By date lists skipped payments but leaves them out of month totals');
+    assert.match(extract(operationsScripts, 'renderCompanyExpensesModal'), /showExpenseLedgerMonth\(shownMonth\.year, shownMonth\.month\)/, 'the Time Entry popup opens the ledger on its month');
+  });
+
+  test('the company expenses breakdown lists the month\'s schedule payments as not counted yet', () => {
+    const { context: c } = backend('2026-10-01', 'financial_year');
+    c.api_upsertExpenseRule(rulePayload({ start_date: '2026-10-20' }));
+    const october = JSON.parse(JSON.stringify(c.api_getCompanyExpensesForMonth({ year: 2026, month: 9, accounting_basis: 'accrual' })));
+    assert.deepStrictEqual([october.expenses.length, october.totals.amount], [0, 0], 'a schedule payment never counts');
+    assert.deepStrictEqual(october.pending.map((e) => [e.vendor, e.status, e.supplier_invoice_date]), [['Insurer', 'scheduled', '2026-10-20']]);
+    assert.deepStrictEqual(october.pending_totals, { amount: 110, amount_ex_gst: 100 });
   });
 
   test('the form links its two amounts, and a change of GST treatment keeps the inc-GST amount', () => {
@@ -1006,9 +1089,10 @@ exports.run = test => {
     const settings = fs.readFileSync(path.join(root, 'views/partials/settings.html'), 'utf8');
     const markup = fs.readFileSync(path.join(root, 'views/partials/operations.html'), 'utf8');
     assert.match(scripts, /expense_creation: \{\s*section: 'enable_expenses',[\s\S]*?defaultValue: 'month'/);
-    assert.match(settings, /<select id="set-expense-creation">\s*<option value="on_date">On scheduled date<\/option>\s*<option value="month">For current month<\/option>\s*<option value="financial_year">For financial year<\/option>/);
+    assert.match(settings, /List scheduled expenses\s*<\/label>/);
+    assert.match(settings, /<select id="set-expense-creation">\s*<option value="on_date">On the day they're due<\/option>\s*<option value="month">For the current month<\/option>\s*<option value="financial_year">For the whole financial year<\/option>/);
     assert.match(extract(operationsScripts, 'loadCompanyExpenseLedgerTotals'), /ensureExpenseOccurrences\(\);/);
-    assert.match(operationsScripts, /await ensureExpenseOccurrences\(\);\s*const filters=/);
+    assert.match(operationsScripts, /await ensureExpenseOccurrences\(\);\s*\/\/ Everything, once[^\n]*\n\s*const \[transactions, rules, categories\] = await Promise\.all\(\[operationsApi\('api_listExpenseTransactions', \{\}\)/);
     assert.ok(!markup.includes('expense-rule-generate') && !operationsScripts.includes('expense-rule-generate'), 'no Extend button');
     assert.ok(!/12 months/.test(markup), 'no mention of 12 months');
   });
