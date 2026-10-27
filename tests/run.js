@@ -345,6 +345,44 @@ test('upgrade verifies a backup, records failure, and resumes without rerunning 
   assert.equal(spreadsheet.getSheets().length, 0);
 });
 
+test('each upgrade takes a fresh backup; only an interrupted upgrade reuses its own', () => {
+  const { context, spreadsheet, properties } = createAppsScriptContext({});
+  const backup = new MockSpreadsheet({});
+  properties.setProperty('tempus_migrations_applied', '[]');
+  // A verified backup left over from an upgrade months ago, with that upgrade finished.
+  properties.setProperty('tempus_migration_backup_v3', JSON.stringify({ id: 'months-old', verified: true, spreadsheet_id: spreadsheet.getId(), url: 'https://drive.google.com/months-old', name: 'Old backup' }));
+  properties.setProperty('tempus_migration_state_v3', JSON.stringify({ state: 'complete' }));
+  let copies = 0;
+  context.SpreadsheetApp.openById = () => backup;
+  context.DriveApp = {
+    getRootFolder: () => ({ id: 'root' }),
+    getFileById: () => ({
+      getParents: () => ({ hasNext: () => false }),
+      makeCopy: () => { const id = 'backup-' + (++copies); return { getId: () => id, getUrl: () => 'https://drive.google.com/' + id, getName: () => 'Tempus pre-upgrade backup ' + id }; }
+    })
+  };
+  context.assertMigrationsSettled_ = () => true;
+  load(context, 'backend/sheets.ts.js');
+  load(context, 'backend/migrations.js');
+  const backupId = () => JSON.parse(properties.getProperty('tempus_migration_backup_v3')).id;
+  let fail = true;
+  const migrations = [{ id: 'one', run: () => { if (fail) { fail = false; throw new Error('forced interruption'); } } }];
+  context.listMigrations = () => migrations;
+
+  assert.equal(context.api_runUpgrade().success, false);
+  assert.equal(copies, 1, 'the months-old backup is not reused');
+  assert.equal(backupId(), 'backup-1');
+
+  assert.equal(context.api_runUpgrade().state, 'complete');
+  assert.equal(copies, 1, 'resuming the interrupted upgrade keeps its pre-upgrade backup');
+
+  migrations.push({ id: 'two', run: () => {} });
+  context.__migrationsSettledMemo = false;
+  assert.equal(context.api_runUpgrade().state, 'complete');
+  assert.equal(copies, 2, 'a later upgrade takes its own backup');
+  assert.equal(backupId(), 'backup-2');
+});
+
 test('PAYG tables switch at the Australian financial-year boundary and warn when stale', () => {
   const { context } = createAppsScriptContext({});
   load(context, 'backend/tax.js');

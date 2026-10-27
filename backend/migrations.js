@@ -144,6 +144,7 @@ function api_runUpgrade(options) {
       writeMigrationState_(props, progress);
     }
     __migrationsSettledMemo = true;
+    // No backup_id here, so the next upgrade takes its own fresh backup rather than reusing this one.
     writeMigrationState_(props, { state: 'complete', current_migration: '', completed_count: listMigrations().length, error: '', completed_at: migrationIsoNow_() });
     return api_getMigrationStatus();
   } catch (error) {
@@ -159,11 +160,19 @@ function api_runUpgrade(options) {
   }
 }
 
+/**
+ * Every upgrade starts from a fresh, verified copy of the spreadsheet. The only backup reused is the
+ * one taken at the start of an upgrade that was interrupted and is now being resumed: that run may have
+ * already changed data, so a new copy would no longer be a pre-upgrade copy. Data cannot change in
+ * between, because writes are blocked while migrations are pending (assertMigrationsSettled_).
+ */
 function ensureVerifiedUpgradeBackup_(props) {
+  var spreadsheet = SpreadsheetApp.getActiveSpreadsheet();
   var existing = null;
   try { existing = JSON.parse(props.getProperty(MIGRATION_BACKUP_PROP_KEY) || 'null'); } catch (error) { existing = null; }
-  if (existing && existing.verified && existing.spreadsheet_id === SpreadsheetApp.getActiveSpreadsheet().getId()) return existing;
-  var spreadsheet = SpreadsheetApp.getActiveSpreadsheet();
+  var state = readMigrationState_(props);
+  var resuming = (state.state === 'running' || state.state === 'error') && !!state.backup_id;
+  if (resuming && existing && existing.verified && existing.id === state.backup_id && existing.spreadsheet_id === spreadsheet.getId()) return existing;
   var sourceFile = DriveApp.getFileById(spreadsheet.getId());
   var parents = sourceFile.getParents();
   var parent = parents.hasNext() ? parents.next() : DriveApp.getRootFolder();

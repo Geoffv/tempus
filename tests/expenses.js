@@ -1115,7 +1115,15 @@ exports.run = test => {
     const { context: c, properties, spreadsheet } = legacyLedger();
     const others = c.listMigrations().map((m) => m.id).filter((id) => id !== c.SIMPLIFIED_EXPENSE_LEDGER_MIGRATION_ID);
     properties.setProperty('tempus_migrations_applied', JSON.stringify(others));
-    properties.setProperty('tempus_migration_backup_v3', JSON.stringify({ verified: true, spreadsheet_id: spreadsheet.getId(), url: 'https://drive.google.com/backup', name: 'Backup' }));
+    let copies = 0;
+    c.SpreadsheetApp.openById = () => spreadsheet;
+    c.DriveApp = {
+      getRootFolder: () => ({ id: 'root' }),
+      getFileById: () => ({
+        getParents: () => ({ hasNext: () => false }),
+        makeCopy: () => { copies++; return { getId: () => 'backup', getUrl: () => 'https://drive.google.com/backup', getName: () => 'Backup' }; }
+      })
+    };
     const preview = c.api_getUpgradePreview();
     assert.equal(preview.requires_confirmation, true);
     const before = JSON.stringify(spreadsheet.getSheetByName('expense_transactions').getDataRange().getValues());
@@ -1124,6 +1132,7 @@ exports.run = test => {
     assert.match(refused.message, /1 part-paid expense\(s\) will become unpaid/);
     assert.equal(JSON.stringify(spreadsheet.getSheetByName('expense_transactions').getDataRange().getValues()), before, 'nothing changed');
     assert.ok(c.api_getMigrationStatus().required, 'the upgrade is still pending');
+    assert.equal(copies, 0, 'no backup is taken until the user confirms');
     const done = c.api_runUpgrade({ confirm_part_paid: true });
     assert.equal(done.state, 'complete');
     assert.equal(rowsById(c).part.paid_date, '');
