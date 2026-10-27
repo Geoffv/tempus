@@ -107,24 +107,6 @@ function expenseResolveCategory_(item, index) {
 }
 
 /**
- * Removes a schedule's upcoming payments due on or after `fromDate` (and, if given, only after `afterDate`).
- * With `keepEdited`, a payment changed by hand ("Edit this payment") is kept. Returns { removed, kept }.
- */
-function removeScheduledExpenseOccurrences_(ruleId, fromDate, options) {
-  var opts = options || {};
-  var data = expenseReadSheet_('expense_transactions');
-  var kept = 0;
-  var rows = data.rows.filter(function(item) {
-    if ((ruleId && String(item.source_rule_id) !== String(ruleId)) || !item.source_rule_id || String(item.status) !== 'scheduled') return false;
-    var due = String(item.supplier_invoice_date);
-    if (due < String(fromDate) || (opts.afterDate && due <= String(opts.afterDate))) return false;
-    if (opts.keepEdited && expenseBoolean_(item.occurrence_edited)) { kept++; return false; }
-    return true;
-  }).map(function(item) { return item.__row; });
-  return { removed: deleteSheetRowsDescending_(data.sheet, rows), kept: kept };
-}
-
-/**
  * How far ahead schedule payments are created (Settings, "Expense creation"): 'on_date' creates each on its
  * due date, 'month' (the default) the whole current month, 'financial_year' through 30 June.
  */
@@ -144,14 +126,6 @@ function expenseCreationWindowEnd_(mode, today) {
   return year + '-' + today.slice(5, 7) + '-' + ('0' + new Date(Date.UTC(year, month, 0, 12)).getUTCDate()).slice(-2);
 }
 
-/** Writes one rule's generated_through (how far its payments have been created). */
-function expenseSetGeneratedThrough_(ruleId, through) {
-  var found = expenseFind_('expense_rules', ruleId);
-  var column = found.data.headers.indexOf('generated_through');
-  if (!found.item || column === -1) return;
-  found.data.sheet.getRange(found.item.__row, column + 1).setValue(through);
-}
-
 /**
  * Brings every schedule's payments in line with the Expense creation setting: creates any due from where
  * it last got to (so payments missed while Tempus wasn't opened appear as Due) through the end of the
@@ -159,22 +133,84 @@ function expenseSetGeneratedThrough_(ruleId, through) {
  * shorter option). Safe to run repeatedly; runs when Tempus and the Expenses page open.
  */
 function api_ensureExpenseOccurrences() {
+  var today = expenseToday_();
+  var mode = expenseCreationMode_();
+  var windowEnd = expenseCreationWindowEnd_(mode, today);
+  var result = { success: true, mode: mode, through_date: windowEnd, created_count: 0, removed_count: 0 };
+  // Runs on every open, so the usual case costs one read of expense_rules and no lock: nothing to do when
+  // every schedule is already created through this window and none has changed since the last full update
+  // (an end date shortened directly in the sheet still needs its later payments removed).
+  if (expenseSchedulesUpToDate_(expenseReadSheet_('expense_rules').rows, windowEnd)) { result.skipped = true; return result; }
   return withScriptLock_('expense schedule update', function() {
-    var today = expenseToday_();
-    var mode = expenseCreationMode_();
-    var windowEnd = expenseCreationWindowEnd_(mode, today);
     var rules = api_listExpenseRules({});
-    var removed = removeScheduledExpenseOccurrences_('', today, { afterDate: windowEnd, keepEdited: true }).removed + removeExpenseOccurrencesAfterEndDates_(rules);
-    var created = 0;
+    if (expenseSchedulesUpToDate_(rules, windowEnd)) { result.skipped = true; return result; }
+    // One read of expense_transactions for the whole update.
+    var data = expenseReadSheet_('expense_transactions');
+    var ends = {};
+    rules.forEach(function(rule) { if (rule.end_date) ends[String(rule.id)] = String(rule.end_date); });
+    var removeRows = [];
+    var keep = data.rows.filter(function(item) {
+      if (String(item.status) === 'scheduled' && item.source_rule_id) {
+        var due = String(item.supplier_invoice_date);
+        var end = ends[String(item.source_rule_id)];
+        // Past its schedule's end date (Due and edited ones too), or an upcoming payment past the window
+        // that wasn't edited by hand (after switching to a shorter Expense creation option).
+        if ((end && due > end) || (due >= today && due > windowEnd && !expenseBoolean_(item.occurrence_edited))) { removeRows.push(item.__row); return false; }
+      }
+      return true;
+    });
+    result.removed_count = removeRows.length ? deleteSheetRowsDescending_(data.sheet, removeRows) : 0;
+    var existing = expenseClaimedOccurrences_(keep);
     rules.forEach(function(rule) {
       var through = String(rule.generated_through || '');
       var from = through ? addDaysIso(through > windowEnd ? windowEnd : through, 1) : today;
-      created += generateExpenseOccurrencesForRules_([rule], from, windowEnd).length;
-      if (through !== windowEnd) expenseSetGeneratedThrough_(rule.id, windowEnd);
+      result.created_count += generateExpenseOccurrencesForRules_([rule], from, windowEnd, { sheet: data.sheet, headers: data.headers, existing: existing }).length;
     });
-    if (created || removed) cacheClearPrefix(EXPENSE_CACHE_PREFIX);
-    return { success: true, mode: mode, through_date: windowEnd, created_count: created, removed_count: removed };
+    expenseSetAllGeneratedThrough_(rules, windowEnd);
+    PropertiesService.getScriptProperties().setProperty(EXPENSE_SCHEDULES_ENSURED_PROP_KEY, expenseSchedulesFingerprint_(rules, windowEnd));
+    if (result.created_count || result.removed_count) cacheClearPrefix(EXPENSE_CACHE_PREFIX);
+    return result;
   });
+}
+
+/** Fingerprint of the schedules and window as of the last full api_ensureExpenseOccurrences update. */
+var EXPENSE_SCHEDULES_ENSURED_PROP_KEY = 'tempus_expense_schedules_ensured';
+
+function expenseSchedulesFingerprint_(rules, windowEnd) {
+  return sha256Hex_(windowEnd + '\n' + rules.map(function(rule) {
+    return [rule.id, rule.start_date, rule.end_date, rule.frequency].map(function(value) { return String(value == null ? '' : value); }).join('|');
+  }).join('\n'));
+}
+
+/**
+ * Whether the full update can be skipped: every schedule's payments are already created through
+ * `windowEnd`, and no schedule was added, removed or had its dates or frequency changed since the last
+ * full update (as happens when the sheet is edited directly).
+ */
+function expenseSchedulesUpToDate_(rules, windowEnd) {
+  if (!rules.every(function(rule) { return String(rule.generated_through || '') === windowEnd; })) return false;
+  return PropertiesService.getScriptProperties().getProperty(EXPENSE_SCHEDULES_ENSURED_PROP_KEY) === expenseSchedulesFingerprint_(rules, windowEnd);
+}
+
+/** "rule id|occurrence key" for every listed transaction that came from a schedule. */
+function expenseClaimedOccurrences_(rows) {
+  var existing = {};
+  rows.forEach(function(item) { if (item.source_rule_id && item.source_occurrence_key) existing[String(item.source_rule_id) + '|' + String(item.source_occurrence_key)] = true; });
+  return existing;
+}
+
+/**
+ * Sets generated_through on every schedule in one write. `rules` is api_listExpenseRules, which lists the
+ * sheet's rows in order, so rule N is on row N + 2. Called under the script lock, so the sheet can't change
+ * between the two.
+ */
+function expenseSetAllGeneratedThrough_(rules, through) {
+  if (!rules.length || rules.every(function(rule) { return String(rule.generated_through || '') === through; })) return;
+  var sheet = getOrCreateSheet('expense_rules');
+  var headers = sheet.getRange(1, 1, 1, sheet.getLastColumn()).getValues()[0];
+  var column = headers.indexOf('generated_through');
+  if (column === -1) return;
+  sheet.getRange(2, column + 1, rules.length, 1).setValues(rules.map(function() { return [through]; }));
 }
 
 function normalizeExpenseRule_(payload, existing) {
@@ -319,31 +355,19 @@ function api_archiveExpenseRule(id) {
   return api_upsertExpenseRule(Object.assign(rule, { confirm_changes: true }));
 }
 
-/**
- * Removes every unpaid payment due after its schedule's end date, Due and hand-edited ones included. Schedules
- * whose end date was set before this rule existed, or edited in the sheet, are tidied when Tempus opens.
- */
-function removeExpenseOccurrencesAfterEndDates_(rules) {
-  var ends = {};
-  rules.forEach(function(rule) { if (rule.end_date) ends[String(rule.id)] = String(rule.end_date); });
-  var data = expenseReadSheet_('expense_transactions');
-  var rows = data.rows.filter(function(item) {
-    var end = ends[String(item.source_rule_id)];
-    return end && String(item.status) === 'scheduled' && String(item.supplier_invoice_date) > end;
-  }).map(function(item) { return item.__row; });
-  return rows.length ? deleteSheetRowsDescending_(data.sheet, rows) : 0;
-}
-
 /** Kept for older pages: does what opening the Expenses page does (see api_ensureExpenseOccurrences). */
 function api_generateExpenseRuleOccurrences() {
   return api_ensureExpenseOccurrences();
 }
 
-/** Appends the scheduled payments of each rule due from `from` through `through`, skipping any date already claimed. */
-function generateExpenseOccurrencesForRules_(rules, from, through) {
-  var transactionData = expenseReadSheet_('expense_transactions');
-  var existing = {};
-  transactionData.rows.forEach(function(item) { if (item.source_rule_id && item.source_occurrence_key) existing[String(item.source_rule_id) + '|' + String(item.source_occurrence_key)] = true; });
+/**
+ * Appends the scheduled payments of each rule due from `from` through `through`, skipping any date already
+ * claimed. `shared` ({ sheet, headers, existing }) lets a caller that has already read expense_transactions
+ * reuse that read; `existing` is updated as payments are created.
+ */
+function generateExpenseOccurrencesForRules_(rules, from, through, shared) {
+  var transactionData = shared || expenseReadSheet_('expense_transactions');
+  var existing = shared ? shared.existing : expenseClaimedOccurrences_(transactionData.rows);
   var created = [];
   rules.forEach(function(rule) {
     if (from > through) return;

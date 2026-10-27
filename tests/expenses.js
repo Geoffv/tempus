@@ -176,6 +176,53 @@ exports.run = test => {
     assert.deepStrictEqual(scheduled(c, rule.id), ['2026-10-15', '2026-11-15']);
   });
 
+  test('opening Tempus reads the expense sheet once, and skips the work when schedules are up to date', () => {
+    const { context: c } = backend('2026-10-01', 'month');
+    const ids = ['Insurer', 'Hosting', 'Phone'].map((vendor, i) => c.api_upsertExpenseRule(rulePayload({ vendor, start_date: '2026-09-1' + i })).rule.id);
+    const reads = {};
+    const read = c.expenseReadSheet_;
+    c.expenseReadSheet_ = (name) => { reads[name] = (reads[name] || 0) + 1; return read(name); };
+    let locks = 0;
+    const lock = c.withScriptLock_;
+    c.withScriptLock_ = (name, fn) => { locks++; return lock(name, fn); };
+
+    // A month later: each schedule needs its November payment.
+    c.expenseToday_ = () => '2026-11-02';
+    const full = c.api_ensureExpenseOccurrences();
+    assert.equal(full.created_count, 3);
+    assert.ok(!full.skipped);
+    assert.equal(reads.expense_transactions, 1, 'one read of expense_transactions for all three schedules');
+    assert.deepStrictEqual(ids.map((id) => scheduled(c, id).length), [2, 2, 2]);
+
+    for (const key of Object.keys(reads)) delete reads[key];
+    locks = 0;
+    const again = c.api_ensureExpenseOccurrences();
+    assert.deepStrictEqual([again.skipped, again.created_count, again.removed_count, again.through_date], [true, 0, 0, '2026-11-30']);
+    assert.deepStrictEqual(reads, { expense_rules: 1 }, 'only the schedules are read');
+    assert.equal(locks, 0, 'no lock when there is nothing to do');
+  });
+
+  test('the quick check still notices a schedule added or changed directly in the sheet', () => {
+    // Financial year: the window end (30 June) doesn't move for months, so generated_through alone can't tell.
+    const { context: c } = backend('2026-10-01', 'financial_year');
+    const rule = c.api_upsertExpenseRule(rulePayload()).rule;
+    c.api_ensureExpenseOccurrences();
+    assert.equal(c.api_ensureExpenseOccurrences().skipped, true);
+    assert.equal(scheduled(c, rule.id).length, 9);
+    // Shortening the end date in the sheet (generated_through is untouched) makes the next open do the full update.
+    const sheet = c.getOrCreateSheet('expense_rules');
+    const headers = sheet.getDataRange().getValues()[0];
+    sheet.getRange(2, headers.indexOf('end_date') + 1).setValue('2026-11-30');
+    const result = c.api_ensureExpenseOccurrences();
+    assert.deepStrictEqual([!!result.skipped, result.removed_count], [false, 7]);
+    assert.deepStrictEqual(scheduled(c, rule.id), ['2026-10-15', '2026-11-15']);
+    assert.equal(c.api_ensureExpenseOccurrences().skipped, true);
+    // A schedule appended directly in the sheet is noticed too.
+    sheet.appendRow(c.rowValuesFromObject_(headers, { id: 'by-hand', vendor: 'Hosting', amount: 22, gst_code: 'taxable', gst_amount: 2, frequency: 'monthly', start_date: '2026-10-20', end_date: '', active: 'TRUE' }));
+    assert.ok(!c.api_ensureExpenseOccurrences().skipped);
+    assert.equal(scheduled(c, 'by-hand')[0], '2026-10-20');
+  });
+
   test('the upgrade gives a paused schedule an end date so it stays stopped', () => {
     const { context: c } = backend('2026-10-25', 'financial_year');
     c.api_listExpenseRules({});
